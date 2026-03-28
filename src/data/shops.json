@@ -1,0 +1,98 @@
+[
+  {
+    "shopId": "s_001",
+    "ownerId": "u_101",
+    "shopName": "Sharma Grocery",
+    "area": "Munger",
+    "category": "Grocery",
+    "isOpen": true,
+    "rating": 4.3,
+    "ownerPhone": "9876543210",
+    "shopAddress": "12, Station Road, Munger, Bihar",
+    "ownerSpecialization": "Retail"
+  },
+  {
+    "shopId": "s_002",
+    "ownerId": "u_103",
+    "shopName": "RK Electronics",
+    "area": "Munger",
+    "category": "Electronics",
+    "isOpen": true,
+    "rating": 4.1,
+    "ownerPhone": "9123456780",
+    "shopAddress": "45, Kasim Bazar, Munger, Bihar",
+    "ownerSpecialization": "Retail"
+  },
+  {
+    "shopId": "s_003",
+    "ownerId": "u_104",
+    "shopName": "Patna Fashions",
+    "area": "Patna",
+    "category": "Ethnic Wear",
+    "isOpen": false,
+    "rating": 3.8,
+    "ownerPhone": "9001122334",
+    "shopAddress": "78, Boring Road, Patna, Bihar",
+    "ownerSpecialization": "Wholesale"
+  },
+  {
+    "shopId": "s_004",
+    "ownerId": "u_105",
+    "shopName": "Jamalpur Dairy",
+    "area": "Jamalpur",
+    "category": "Dairy",
+    "isOpen": true,
+    "rating": 4.5,
+    "ownerPhone": "9988776655",
+    "shopAddress": "3, Loco Colony, Jamalpur, Bihar",
+    "ownerSpecialization": "Retail"
+  },
+  {
+    "shopId": "s_005",
+    "ownerId": "u_106",
+    "shopName": "Munger Mart",
+    "area": "Munger",
+    "category": "Grocery",
+    "isOpen": true,
+    "rating": 4.0,
+    "ownerPhone": "9445566778",
+    "shopAddress": "22, Gandhi Chowk, Munger, Bihar",
+    "ownerSpecialization": "Both"
+  },
+  {
+    "shopId": "s_006",
+    "ownerId": "u_107",
+    "shopName": "Darbhanga Cloth House",
+    "area": "Darbhanga",
+    "category": "Fabrics",
+    "isOpen": true,
+    "rating": 4.2,
+    "ownerPhone": "9554433221",
+    "shopAddress": "56, Laheriasarai, Darbhanga, Bihar",
+    "ownerSpecialization": "Wholesale"
+  },
+  {
+    "shopId": "s_007",
+    "ownerId": "u_108",
+    "shopName": "Patna Electronics Hub",
+    "area": "Patna",
+    "category": "Electronics",
+    "isOpen": false,
+    "rating": 3.9,
+    "ownerPhone": "9667788990",
+    "shopAddress": "90, Frazer Road, Patna, Bihar",
+    "ownerSpecialization": "Retail"
+  },
+  {
+    "shopId": "s_008",
+    "ownerId": "u_109",
+    "shopName": "Fresh Dairy Munger",
+    "area": "Munger",
+    "category": "Dairy",
+    "isOpen": true,
+    "rating": 4.4,
+    "ownerPhone": "9778899001",
+    "shopAddress": "8, Civil Lines, Munger, Bihar",
+    "ownerSpecialization": "Retail"
+  }
+]

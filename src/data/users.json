@@ -1,0 +1,16 @@
+[
+  {
+    "phoneNumber": "9876543210",
+    "role": "owner",
+    "userId": "u_101",
+    "isSetupComplete": true,
+    "name": "Sharma Ji"
+  },
+  {
+    "phoneNumber": "1234567890",
+    "role": "customer",
+    "userId": "u_102",
+    "isSetupComplete": true,
+    "name": "Rahul Kumar"
+  }
+]
