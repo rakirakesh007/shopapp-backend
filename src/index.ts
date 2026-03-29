@@ -246,6 +246,49 @@ app.post('/api/products', async (req: Request, res: Response) => {
 });
 
 /**
+ * PATCH /api/products/:productId
+ * Body: { name?, category?, price?, stock?, minStock?, unit?, imageUrl? }
+ * Updates product details (full edit — separate from stock-only PATCH).
+ */
+app.patch('/api/products/:productId', async (req: Request, res: Response) => {
+  const { productId } = req.params;
+  const { name, category, price, stock, minStock, unit, imageUrl } = req.body as {
+    name?: string; category?: string; price?: number;
+    stock?: number; minStock?: number; unit?: string; imageUrl?: string;
+  };
+
+  if (!name && !category && price == null && stock == null && minStock == null && !unit && !imageUrl) {
+    return res.status(400).json({ success: false, message: 'At least one field to update is required' });
+  }
+
+  try {
+    const sets: string[] = [];
+    const vals: (string | number)[] = [];
+    let i = 1;
+    if (name      !== undefined) { sets.push(`name = $${i++}`);       vals.push(name); }
+    if (category  !== undefined) { sets.push(`category = $${i++}`);   vals.push(category); }
+    if (price     !== undefined) { sets.push(`price = $${i++}`);      vals.push(price); }
+    if (stock     !== undefined) { sets.push(`stock = $${i++}`);      vals.push(stock); }
+    if (minStock  !== undefined) { sets.push(`min_stock = $${i++}`);  vals.push(minStock); }
+    if (unit      !== undefined) { sets.push(`unit = $${i++}`);       vals.push(unit); }
+    if (imageUrl  !== undefined) { sets.push(`image_url = $${i++}`);  vals.push(imageUrl); }
+    vals.push(productId);
+
+    const { rows } = await pool.query(
+      `UPDATE products SET ${sets.join(', ')} WHERE product_id = $${i} RETURNING *`,
+      vals,
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+    return res.json({ success: true, product: rowToProduct(rows[0]) });
+  } catch (err) {
+    console.error('updateProduct error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
  * DELETE /api/products/:productId
  * Removes a product from the database.
  */
