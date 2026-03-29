@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-import { pool, initDb, rowToUser, rowToShop } from './db';
+import { pool, initDb, rowToUser, rowToShop, rowToProduct, rowToOrder } from './db';
 
 dotenv.config();
 
@@ -163,6 +163,192 @@ app.patch('/api/shop/status', async (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error('toggleStatus error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRODUCT ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/products/:shopId
+ * Returns all products belonging to a shop.
+ */
+app.get('/api/products/:shopId', async (req: Request, res: Response) => {
+  const { shopId } = req.params;
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM products WHERE shop_id = $1 ORDER BY name',
+      [shopId],
+    );
+    return res.json({ success: true, products: rows.map(rowToProduct) });
+  } catch (err) {
+    console.error('getProducts error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
+ * PATCH /api/products/:productId/stock
+ * Body: { stock: number }
+ * Updates the stock count for a product.
+ */
+app.patch('/api/products/:productId/stock', async (req: Request, res: Response) => {
+  const { productId } = req.params;
+  const { stock } = req.body as { stock?: number };
+
+  if (typeof stock !== 'number' || stock < 0) {
+    return res.status(400).json({ success: false, message: 'stock (non-negative number) is required' });
+  }
+  try {
+    const { rows } = await pool.query(
+      'UPDATE products SET stock = $1 WHERE product_id = $2 RETURNING *',
+      [stock, productId],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+    return res.json({ success: true, product: rowToProduct(rows[0]) });
+  } catch (err) {
+    console.error('updateStock error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
+ * POST /api/products
+ * Body: { shopId, name, category, price, stock, minStock, unit?, imageUrl? }
+ * Creates a new product for a shop.
+ */
+app.post('/api/products', async (req: Request, res: Response) => {
+  const { shopId, name, category, price, stock, minStock, unit, imageUrl } = req.body as {
+    shopId?: string; name?: string; category?: string;
+    price?: number; stock?: number; minStock?: number;
+    unit?: string; imageUrl?: string;
+  };
+
+  if (!shopId || !name || !category || price == null || stock == null || minStock == null) {
+    return res.status(400).json({ success: false, message: 'shopId, name, category, price, stock, minStock are required' });
+  }
+  try {
+    const productId = `p_${Date.now()}`;
+    const { rows } = await pool.query(
+      `INSERT INTO products (product_id, shop_id, name, category, price, stock, min_stock, unit, image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [productId, shopId, name, category, price, stock, minStock, unit ?? 'pcs', imageUrl ?? ''],
+    );
+    return res.status(201).json({ success: true, product: rowToProduct(rows[0]) });
+  } catch (err) {
+    console.error('addProduct error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/orders
+ * Body: { customerName, customerPhone, shopId, shopName, ownerPhone,
+ *         totalAmount, deliveryType, deliveryAddress?, estimatedPickupTime?,
+ *         items: [{ name, qty, price }] }
+ * Creates a new order with its items.
+ */
+app.post('/api/orders', async (req: Request, res: Response) => {
+  const { customerName, customerPhone, shopId, shopName, ownerPhone,
+          totalAmount, deliveryType, deliveryAddress, estimatedPickupTime, items } = req.body as {
+    customerName?: string; customerPhone?: string;
+    shopId?: string; shopName?: string; ownerPhone?: string;
+    totalAmount?: number; deliveryType?: string;
+    deliveryAddress?: string; estimatedPickupTime?: string;
+    items?: Array<{ name: string; qty: number; price: number }>;
+  };
+
+  if (!customerName || !customerPhone || !shopId || !shopName || !ownerPhone ||
+      totalAmount == null || !deliveryType || !items?.length) {
+    return res.status(400).json({ success: false, message: 'Missing required order fields' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const orderId = `ord_${Date.now()}`;
+    await client.query(
+      `INSERT INTO orders
+         (order_id, customer_name, customer_phone, shop_id, shop_name, owner_phone,
+          total_amount, delivery_type, delivery_address, estimated_pickup_time)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [orderId, customerName, customerPhone, shopId, shopName, ownerPhone,
+       totalAmount, deliveryType, deliveryAddress ?? null, estimatedPickupTime ?? null],
+    );
+    for (const item of items) {
+      await client.query(
+        'INSERT INTO order_items (order_id, name, qty, price) VALUES ($1,$2,$3,$4)',
+        [orderId, item.name, item.qty, item.price],
+      );
+    }
+    await client.query('COMMIT');
+    return res.status(201).json({ success: true, orderId, message: 'Order placed successfully' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('placeOrder error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/orders/shop/:ownerPhone
+ * Returns all orders for a shop (owner view), most recent first.
+ */
+app.get('/api/orders/shop/:ownerPhone', async (req: Request, res: Response) => {
+  const { ownerPhone } = req.params;
+  try {
+    const { rows: orderRows } = await pool.query(
+      'SELECT * FROM orders WHERE owner_phone = $1 ORDER BY created_at DESC',
+      [ownerPhone],
+    );
+    const orders = await Promise.all(orderRows.map(async (o) => {
+      const { rows: itemRows } = await pool.query(
+        'SELECT * FROM order_items WHERE order_id = $1',
+        [o.order_id],
+      );
+      return rowToOrder(o, itemRows);
+    }));
+    return res.json({ success: true, orders });
+  } catch (err) {
+    console.error('getShopOrders error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
+ * PATCH /api/orders/:orderId/status
+ * Body: { status: 'newOrder' | 'preparing' | 'ready' | 'completed' }
+ * Advances an order's status.
+ */
+app.patch('/api/orders/:orderId/status', async (req: Request, res: Response) => {
+  const { orderId } = req.params;
+  const { status } = req.body as { status?: string };
+  const valid = ['newOrder', 'preparing', 'ready', 'completed'];
+
+  if (!status || !valid.includes(status)) {
+    return res.status(400).json({ success: false, message: `status must be one of: ${valid.join(', ')}` });
+  }
+  try {
+    const { rows } = await pool.query(
+      'UPDATE orders SET status = $1 WHERE order_id = $2 RETURNING *',
+      [status, orderId],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    return res.json({ success: true, message: `Order is now "${status}"`, order: rowToOrder(rows[0]) });
+  } catch (err) {
+    console.error('updateOrderStatus error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
