@@ -245,6 +245,27 @@ app.post('/api/products', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * DELETE /api/products/:productId
+ * Removes a product from the database.
+ */
+app.delete('/api/products/:productId', async (req: Request, res: Response) => {
+  const { productId } = req.params;
+  try {
+    const { rowCount } = await pool.query(
+      'DELETE FROM products WHERE product_id = $1',
+      [productId],
+    );
+    if (rowCount === 0) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+    return res.json({ success: true, message: 'Product deleted' });
+  } catch (err) {
+    console.error('deleteProduct error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ORDER ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -349,6 +370,31 @@ app.patch('/api/orders/:orderId/status', async (req: Request, res: Response) => 
     return res.json({ success: true, message: `Order is now "${status}"`, order: rowToOrder(rows[0]) });
   } catch (err) {
     console.error('updateOrderStatus error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
+ * GET /api/orders/customer/:phone
+ * Returns all orders placed by a customer, most recent first.
+ */
+app.get('/api/orders/customer/:phone', async (req: Request, res: Response) => {
+  const { phone } = req.params;
+  try {
+    const { rows: orderRows } = await pool.query(
+      'SELECT * FROM orders WHERE customer_phone = $1 ORDER BY created_at DESC',
+      [phone],
+    );
+    const orders = await Promise.all(orderRows.map(async (o) => {
+      const { rows: itemRows } = await pool.query(
+        'SELECT * FROM order_items WHERE order_id = $1',
+        [o.order_id],
+      );
+      return rowToOrder(o, itemRows);
+    }));
+    return res.json({ success: true, orders });
+  } catch (err) {
+    console.error('getCustomerOrders error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
