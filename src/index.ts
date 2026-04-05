@@ -110,6 +110,20 @@ app.post('/api/register', async (req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * GET /api/shops
+ * Returns all shops (for customer discovery).
+ */
+app.get('/api/shops', async (_req: Request, res: Response) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM shops ORDER BY shop_name');
+    return res.json({ success: true, shops: rows.map(rowToShop) });
+  } catch (err) {
+    console.error('getAllShops error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
  * GET /api/shop/:phoneNumber
  * Returns the shop linked to the given owner phone number.
  */
