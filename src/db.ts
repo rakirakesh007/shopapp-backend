@@ -39,9 +39,35 @@ export async function initDb(): Promise<void> {
       rating               DOUBLE PRECISION NOT NULL DEFAULT 0,
       owner_phone          VARCHAR(15)  NOT NULL,
       shop_address         TEXT         NOT NULL DEFAULT '',
-      owner_specialization VARCHAR(50)  NOT NULL DEFAULT ''
+      owner_specialization VARCHAR(50)  NOT NULL DEFAULT '',
+      latitude             DOUBLE PRECISION,
+      longitude            DOUBLE PRECISION,
+      trial_start_date     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+      is_active            BOOLEAN      NOT NULL DEFAULT true,
+      has_paid             BOOLEAN      NOT NULL DEFAULT false,
+      payment_reference    VARCHAR(100),
+      delivery_charge      DOUBLE PRECISION NOT NULL DEFAULT 0
     )
   `);
+
+  // Add new columns if they don't exist (for existing databases)
+  const addCol = async (col: string, type: string, def: string) => {
+    try {
+      await pool.query(`ALTER TABLE shops ADD COLUMN IF NOT EXISTS ${col} ${type} ${def}`);
+    } catch (_) { /* column may already exist */ }
+  };
+  await addCol('latitude',          'DOUBLE PRECISION', '');
+  await addCol('longitude',         'DOUBLE PRECISION', '');
+  await addCol('trial_start_date',  'TIMESTAMPTZ',      'DEFAULT NOW()');
+  await addCol('is_active',         'BOOLEAN',          'DEFAULT true');
+  await addCol('has_paid',          'BOOLEAN',          'DEFAULT false');
+  await addCol('payment_reference', 'VARCHAR(100)',     '');
+  await addCol('delivery_charge',   'DOUBLE PRECISION', 'DEFAULT 0');
+
+  // Unique constraint: prevent duplicate shop_name + shop_address
+  try {
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_name_address ON shops (LOWER(shop_name), LOWER(shop_address)) WHERE shop_address <> ''`);
+  } catch (_) { /* index may already exist */ }
 
   // Create products table
   await pool.query(`
@@ -137,16 +163,16 @@ export async function initDb(): Promise<void> {
   if (!shopCount) {
     await pool.query(`
       INSERT INTO shops
-        (shop_id, owner_id, shop_name, area, category, is_open, rating, owner_phone, shop_address, owner_specialization)
+        (shop_id, owner_id, shop_name, area, category, is_open, rating, owner_phone, shop_address, owner_specialization, latitude, longitude)
       VALUES
-        ('s_001','u_101','Sharma Grocery',       'Munger',    'Grocery',     true,  4.3,'9876543210','12, Station Road, Munger, Bihar',     'Retail'),
-        ('s_002','u_103','RK Electronics',        'Munger',    'Electronics', true,  4.1,'9123456780','45, Kasim Bazar, Munger, Bihar',      'Retail'),
-        ('s_003','u_104','Patna Fashions',         'Patna',     'Ethnic Wear', false, 3.8,'9001122334','78, Boring Road, Patna, Bihar',       'Wholesale'),
-        ('s_004','u_105','Jamalpur Dairy',         'Jamalpur',  'Dairy',       true,  4.5,'9988776655','3, Loco Colony, Jamalpur, Bihar',    'Retail'),
-        ('s_005','u_106','Munger Mart',            'Munger',    'Grocery',     true,  4.0,'9445566778','22, Gandhi Chowk, Munger, Bihar',    'Both'),
-        ('s_006','u_107','Darbhanga Cloth House',  'Darbhanga', 'Fabrics',     true,  4.2,'9554433221','56, Laheriasarai, Darbhanga, Bihar', 'Wholesale'),
-        ('s_007','u_108','Patna Electronics Hub',  'Patna',     'Electronics', false, 3.9,'9667788990','90, Frazer Road, Patna, Bihar',      'Retail'),
-        ('s_008','u_109','Fresh Dairy Munger',     'Munger',    'Dairy',       true,  4.4,'9778899001','8, Civil Lines, Munger, Bihar',      'Retail')
+        ('s_001','u_101','Sharma Grocery',       'Munger',    'Grocery',     true,  4.3,'9876543210','12, Station Road, Munger, Bihar',     'Retail',    25.3745, 86.4735),
+        ('s_002','u_103','RK Electronics',        'Munger',    'Electronics', true,  4.1,'9123456780','45, Kasim Bazar, Munger, Bihar',      'Retail',    25.3750, 86.4740),
+        ('s_003','u_104','Patna Fashions',         'Patna',     'Ethnic Wear', false, 3.8,'9001122334','78, Boring Road, Patna, Bihar',       'Wholesale', 25.6093, 85.1376),
+        ('s_004','u_105','Jamalpur Dairy',         'Jamalpur',  'Dairy',       true,  4.5,'9988776655','3, Loco Colony, Jamalpur, Bihar',    'Retail',    25.3133, 86.4875),
+        ('s_005','u_106','Munger Mart',            'Munger',    'Grocery',     true,  4.0,'9445566778','22, Gandhi Chowk, Munger, Bihar',    'Both',      25.3760, 86.4730),
+        ('s_006','u_107','Darbhanga Cloth House',  'Darbhanga', 'Fabrics',     true,  4.2,'9554433221','56, Laheriasarai, Darbhanga, Bihar', 'Wholesale', 26.1523, 85.8915),
+        ('s_007','u_108','Patna Electronics Hub',  'Patna',     'Electronics', false, 3.9,'9667788990','90, Frazer Road, Patna, Bihar',      'Retail',    25.6128, 85.1411),
+        ('s_008','u_109','Fresh Dairy Munger',     'Munger',    'Dairy',       true,  4.4,'9778899001','8, Civil Lines, Munger, Bihar',      'Retail',    25.3770, 86.4720)
     `);
     console.log('📦  Seeded 8 shops');
   }
@@ -182,6 +208,13 @@ export function rowToShop(row: any) {
     ownerPhone:          row.owner_phone,
     shopAddress:         row.shop_address,
     ownerSpecialization: row.owner_specialization,
+    latitude:            row.latitude  ?? null,
+    longitude:           row.longitude ?? null,
+    trialStartDate:      row.trial_start_date ?? null,
+    isActive:            row.is_active ?? true,
+    hasPaid:             row.has_paid  ?? false,
+    paymentReference:    row.payment_reference ?? null,
+    deliveryCharge:      row.delivery_charge ?? 0,
   };
 }
 

@@ -91,9 +91,9 @@ app.post('/api/register', async (req: Request, res: Response) => {
     if (role === 'owner') {
       await pool.query(
         `INSERT INTO shops
-           (shop_id, owner_id, shop_name, area, category, is_open, rating, owner_phone, shop_address, owner_specialization)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [`s_${Date.now()}`, userId, name ? `${name}'s Shop` : 'New Shop', '', 'General', false, 0, phoneNumber, '', ''],
+           (shop_id, owner_id, shop_name, area, category, is_open, rating, owner_phone, shop_address, owner_specialization, latitude, longitude, trial_start_date, is_active, has_paid)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), true, false)`,
+        [`s_${Date.now()}`, userId, name ? `${name}'s Shop` : 'New Shop', '', 'General', false, 0, phoneNumber, '', '', latitude ?? null, longitude ?? null],
       );
     }
 
@@ -111,12 +111,50 @@ app.post('/api/register', async (req: Request, res: Response) => {
 
 /**
  * GET /api/shops
- * Returns all shops (for customer discovery).
+ * Query params: lat, lng, radius (km, default 10)
+ * Returns nearby shops if lat/lng provided, else all shops.
+ * Only returns active shops (is_active = true).
  */
-app.get('/api/shops', async (_req: Request, res: Response) => {
+app.get('/api/shops', async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM shops ORDER BY shop_name');
-    return res.json({ success: true, shops: rows.map(rowToShop) });
+    const lat = parseFloat(req.query.lat as string);
+    const lng = parseFloat(req.query.lng as string);
+    const radiusKm = parseFloat(req.query.radius as string) || 10;
+
+    let rows;
+    if (!isNaN(lat) && !isNaN(lng)) {
+      // Haversine formula in SQL to calculate distance in km
+      const result = await pool.query(
+        `SELECT *,
+           ( 6371 * acos(
+               LEAST(1.0, cos(radians($1)) * cos(radians(latitude))
+               * cos(radians(longitude) - radians($2))
+               + sin(radians($1)) * sin(radians(latitude)))
+           )) AS distance_km
+         FROM shops
+         WHERE is_active = true
+           AND latitude IS NOT NULL AND longitude IS NOT NULL
+         HAVING ( 6371 * acos(
+               LEAST(1.0, cos(radians($1)) * cos(radians(latitude))
+               * cos(radians(longitude) - radians($2))
+               + sin(radians($1)) * sin(radians(latitude)))
+           )) <= $3
+         ORDER BY distance_km`,
+        [lat, lng, radiusKm],
+      );
+      rows = result.rows;
+    } else {
+      const result = await pool.query(
+        'SELECT * FROM shops WHERE is_active = true ORDER BY shop_name',
+      );
+      rows = result.rows;
+    }
+
+    const shops = rows.map((r: any) => {
+      const s = rowToShop(r);
+      return { ...s, distanceKm: r.distance_km ? Math.round(r.distance_km * 10) / 10 : null };
+    });
+    return res.json({ success: true, shops });
   } catch (err) {
     console.error('getAllShops error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
@@ -152,7 +190,7 @@ app.get('/api/shop/:phoneNumber', async (req: Request, res: Response) => {
  * Also updates the owner's name in the users table if ownerName is supplied.
  */
 app.patch('/api/shop/details', async (req: Request, res: Response) => {
-  const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName } =
+  const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName, latitude, longitude, deliveryCharge } =
     req.body as {
       phoneNumber?: string;
       shopName?: string;
@@ -160,6 +198,9 @@ app.patch('/api/shop/details', async (req: Request, res: Response) => {
       shopAddress?: string;
       ownerSpecialization?: string;
       ownerName?: string;
+      latitude?: number;
+      longitude?: number;
+      deliveryCharge?: number;
     };
 
   if (!phoneNumber) {
@@ -167,13 +208,27 @@ app.patch('/api/shop/details', async (req: Request, res: Response) => {
   }
 
   try {
+    // Check for duplicate shop_name + shop_address (only if both provided and non-empty)
+    if (shopName && shopAddress && shopAddress.trim() !== '') {
+      const dup = await pool.query(
+        `SELECT shop_id FROM shops WHERE LOWER(shop_name) = LOWER($1) AND LOWER(shop_address) = LOWER($2) AND owner_phone <> $3`,
+        [shopName, shopAddress, phoneNumber],
+      );
+      if (dup.rowCount && dup.rowCount > 0) {
+        return res.status(409).json({ success: false, message: 'A shop with this name and address already exists' });
+      }
+    }
+
     const sets: string[] = [];
-    const vals: (string | null)[] = [];
+    const vals: (string | number | null)[] = [];
     let i = 1;
     if (shopName !== undefined)             { sets.push(`shop_name = $${i++}`);             vals.push(shopName); }
     if (category !== undefined)             { sets.push(`category = $${i++}`);              vals.push(category); }
     if (shopAddress !== undefined)          { sets.push(`shop_address = $${i++}`);          vals.push(shopAddress); }
     if (ownerSpecialization !== undefined)  { sets.push(`owner_specialization = $${i++}`);  vals.push(ownerSpecialization); }
+    if (latitude !== undefined)             { sets.push(`latitude = $${i++}`);              vals.push(latitude); }
+    if (longitude !== undefined)            { sets.push(`longitude = $${i++}`);             vals.push(longitude); }
+    if (deliveryCharge !== undefined)       { sets.push(`delivery_charge = $${i++}`);       vals.push(deliveryCharge); }
 
     if (sets.length > 0) {
       vals.push(phoneNumber);
@@ -523,6 +578,82 @@ app.get('/api/orders/customer/:phone', async (req: Request, res: Response) => {
     return res.json({ success: true, orders });
   } catch (err) {
     console.error('getCustomerOrders error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUBSCRIPTION / TRIAL ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/shop/subscription/:phoneNumber
+ * Returns subscription status for the shop owner.
+ */
+app.get('/api/shop/subscription/:phoneNumber', async (req: Request, res: Response) => {
+  const { phoneNumber } = req.params;
+  try {
+    const { rows } = await pool.query(
+      'SELECT trial_start_date, is_active, has_paid, payment_reference FROM shops WHERE owner_phone = $1',
+      [phoneNumber],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Shop not found' });
+    }
+    const shop = rows[0];
+    const trialStart = new Date(shop.trial_start_date);
+    const now = new Date();
+    const daysSinceTrial = Math.floor((now.getTime() - trialStart.getTime()) / (1000 * 60 * 60 * 24));
+    const trialExpired = daysSinceTrial > 7;
+    const isActive = shop.has_paid || !trialExpired;
+
+    // Auto-deactivate if trial expired and not paid
+    if (!isActive && shop.is_active) {
+      await pool.query('UPDATE shops SET is_active = false WHERE owner_phone = $1', [phoneNumber]);
+    }
+
+    return res.json({
+      success: true,
+      trialStartDate: shop.trial_start_date,
+      daysRemaining: Math.max(0, 7 - daysSinceTrial),
+      trialExpired,
+      hasPaid: shop.has_paid,
+      isActive,
+      paymentReference: shop.payment_reference,
+    });
+  } catch (err) {
+    console.error('getSubscription error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
+ * POST /api/shop/payment
+ * Body: { phoneNumber, paymentReference }
+ * Records a payment reference and activates the shop.
+ */
+app.post('/api/shop/payment', async (req: Request, res: Response) => {
+  const { phoneNumber, paymentReference } = req.body as {
+    phoneNumber?: string;
+    paymentReference?: string;
+  };
+
+  if (!phoneNumber || !paymentReference) {
+    return res.status(400).json({ success: false, message: 'phoneNumber and paymentReference are required' });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE shops SET has_paid = true, is_active = true, payment_reference = $1
+       WHERE owner_phone = $2 RETURNING *`,
+      [paymentReference, phoneNumber],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Shop not found' });
+    }
+    return res.json({ success: true, message: 'Payment recorded. Shop activated!', shop: rowToShop(rows[0]) });
+  } catch (err) {
+    console.error('recordPayment error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
