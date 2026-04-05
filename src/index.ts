@@ -146,6 +146,77 @@ app.get('/api/shop/:phoneNumber', async (req: Request, res: Response) => {
 });
 
 /**
+ * PATCH /api/shop/details
+ * Body: { phoneNumber, shopName?, category?, shopAddress?, ownerSpecialization?, ownerName? }
+ * Updates the shop's display details (called from ShopSetupPage / ProfilePage).
+ * Also updates the owner's name in the users table if ownerName is supplied.
+ */
+app.patch('/api/shop/details', async (req: Request, res: Response) => {
+  const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName } =
+    req.body as {
+      phoneNumber?: string;
+      shopName?: string;
+      category?: string;
+      shopAddress?: string;
+      ownerSpecialization?: string;
+      ownerName?: string;
+    };
+
+  if (!phoneNumber) {
+    return res.status(400).json({ success: false, message: 'phoneNumber is required' });
+  }
+
+  try {
+    const sets: string[] = [];
+    const vals: (string | null)[] = [];
+    let i = 1;
+    if (shopName !== undefined)             { sets.push(`shop_name = $${i++}`);             vals.push(shopName); }
+    if (category !== undefined)             { sets.push(`category = $${i++}`);              vals.push(category); }
+    if (shopAddress !== undefined)          { sets.push(`shop_address = $${i++}`);          vals.push(shopAddress); }
+    if (ownerSpecialization !== undefined)  { sets.push(`owner_specialization = $${i++}`);  vals.push(ownerSpecialization); }
+
+    if (sets.length > 0) {
+      vals.push(phoneNumber);
+      await pool.query(
+        `UPDATE shops SET ${sets.join(', ')} WHERE owner_phone = $${i}`,
+        vals,
+      );
+    }
+
+    if (ownerName !== undefined) {
+      await pool.query(
+        'UPDATE users SET name = $1 WHERE phone_number = $2',
+        [ownerName, phoneNumber],
+      );
+    }
+
+    return res.json({ success: true, message: 'Shop details updated' });
+  } catch (err) {
+    console.error('updateShopDetails error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
+ * PATCH /api/user/name
+ * Body: { phoneNumber, name }
+ * Updates the name field for any user (owner or customer).
+ */
+app.patch('/api/user/name', async (req: Request, res: Response) => {
+  const { phoneNumber, name } = req.body as { phoneNumber?: string; name?: string };
+  if (!phoneNumber || !name) {
+    return res.status(400).json({ success: false, message: 'phoneNumber and name are required' });
+  }
+  try {
+    await pool.query('UPDATE users SET name = $1 WHERE phone_number = $2', [name, phoneNumber]);
+    return res.json({ success: true, message: 'User name updated' });
+  } catch (err) {
+    console.error('updateUserName error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
  * PATCH /api/shop/status
  * Body: { phoneNumber: string, isOpen: boolean }
  * Updates the is_open flag in the `shops` table and returns the updated row.
