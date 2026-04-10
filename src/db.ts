@@ -46,7 +46,9 @@ export async function initDb(): Promise<void> {
       is_active            BOOLEAN      NOT NULL DEFAULT true,
       has_paid             BOOLEAN      NOT NULL DEFAULT false,
       payment_reference    VARCHAR(100),
-      delivery_charge      DOUBLE PRECISION NOT NULL DEFAULT 0
+      delivery_charge      DOUBLE PRECISION NOT NULL DEFAULT 0,
+      ratings_count        INT              NOT NULL DEFAULT 0,
+      subscription_paid_at TIMESTAMPTZ
     )
   `);
 
@@ -62,7 +64,9 @@ export async function initDb(): Promise<void> {
   await addCol('is_active',         'BOOLEAN',          'DEFAULT true');
   await addCol('has_paid',          'BOOLEAN',          'DEFAULT false');
   await addCol('payment_reference', 'VARCHAR(100)',     '');
-  await addCol('delivery_charge',   'DOUBLE PRECISION', 'DEFAULT 0');
+  await addCol('delivery_charge',      'DOUBLE PRECISION', 'DEFAULT 0');
+  await addCol('ratings_count',         'INT',              'DEFAULT 0');
+  await addCol('subscription_paid_at',  'TIMESTAMPTZ',      '');
 
   // Unique constraint: prevent duplicate shop_name + shop_address
   try {
@@ -117,6 +121,18 @@ export async function initDb(): Promise<void> {
     )
   `);
 
+
+  // Create shop_ratings table – one row per customer+shop, prevents duplicate votes
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_ratings (
+      id             SERIAL      PRIMARY KEY,
+      shop_id        VARCHAR(50) NOT NULL,
+      customer_phone VARCHAR(15) NOT NULL,
+      rating         SMALLINT    NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT uq_shop_customer UNIQUE (shop_id, customer_phone)
+    )
+  `);
 
   const { rowCount: userCount } = await pool.query('SELECT 1 FROM users LIMIT 1');
   if (!userCount) {
@@ -214,7 +230,9 @@ export function rowToShop(row: any) {
     isActive:            row.is_active ?? true,
     hasPaid:             row.has_paid  ?? false,
     paymentReference:    row.payment_reference ?? null,
-    deliveryCharge:      row.delivery_charge ?? 0,
+    deliveryCharge:       row.delivery_charge ?? 0,
+    ratingsCount:         row.ratings_count   ?? 0,
+    subscriptionPaidAt:   row.subscription_paid_at ?? null,
   };
 }
 

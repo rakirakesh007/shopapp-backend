@@ -589,37 +589,63 @@ app.get('/api/orders/customer/:phone', async (req: Request, res: Response) => {
 /**
  * GET /api/shop/subscription/:phoneNumber
  * Returns subscription status for the shop owner.
+ * Logic:
+ *   • 7-day free trial from trial_start_date.
+ *   • After paying, subscription valid for 30 days from subscription_paid_at.
+ *   • If neither is active, deactivate the shop automatically.
  */
 app.get('/api/shop/subscription/:phoneNumber', async (req: Request, res: Response) => {
   const { phoneNumber } = req.params;
   try {
     const { rows } = await pool.query(
-      'SELECT trial_start_date, is_active, has_paid, payment_reference FROM shops WHERE owner_phone = $1',
+      'SELECT trial_start_date, is_active, has_paid, payment_reference, subscription_paid_at FROM shops WHERE owner_phone = $1',
       [phoneNumber],
     );
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Shop not found' });
     }
     const shop = rows[0];
-    const trialStart = new Date(shop.trial_start_date);
     const now = new Date();
-    const daysSinceTrial = Math.floor((now.getTime() - trialStart.getTime()) / (1000 * 60 * 60 * 24));
-    const trialExpired = daysSinceTrial > 7;
-    const isActive = shop.has_paid || !trialExpired;
 
-    // Auto-deactivate if trial expired and not paid
+    // ── Trial window (7 days) ─────────────────────────────────────────
+    const trialStart      = new Date(shop.trial_start_date);
+    const daysSinceTrial  = Math.floor((now.getTime() - trialStart.getTime()) / (1000 * 60 * 60 * 24));
+    const trialExpired    = daysSinceTrial > 7;
+    const trialDaysLeft   = Math.max(0, 7 - daysSinceTrial);
+
+    // ── Paid subscription window (30 days from last payment) ──────────
+    let subscriptionExpired = true;
+    let subDaysLeft         = 0;
+    if (shop.subscription_paid_at) {
+      const paidAt          = new Date(shop.subscription_paid_at);
+      const daysSincePayment = Math.floor((now.getTime() - paidAt.getTime()) / (1000 * 60 * 60 * 24));
+      subscriptionExpired   = daysSincePayment > 30;
+      subDaysLeft           = Math.max(0, 30 - daysSincePayment);
+    }
+
+    // Shop is active if either in trial OR paid subscription is still valid
+    const isActive = (!trialExpired) || (shop.has_paid && !subscriptionExpired);
+
+    // Auto-deactivate if neither window is active
     if (!isActive && shop.is_active) {
       await pool.query('UPDATE shops SET is_active = false WHERE owner_phone = $1', [phoneNumber]);
     }
+    // Re-activate if payment is recent (e.g. payment was just recorded)
+    if (isActive && !shop.is_active) {
+      await pool.query('UPDATE shops SET is_active = true WHERE owner_phone = $1', [phoneNumber]);
+    }
 
     return res.json({
-      success: true,
-      trialStartDate: shop.trial_start_date,
-      daysRemaining: Math.max(0, 7 - daysSinceTrial),
+      success:              true,
+      trialStartDate:       shop.trial_start_date,
+      trialDaysRemaining:   trialDaysLeft,
       trialExpired,
-      hasPaid: shop.has_paid,
+      hasPaid:              shop.has_paid,
+      subscriptionPaidAt:   shop.subscription_paid_at ?? null,
+      subscriptionDaysRemaining: subDaysLeft,
+      subscriptionExpired,
       isActive,
-      paymentReference: shop.payment_reference,
+      paymentReference:     shop.payment_reference,
     });
   } catch (err) {
     console.error('getSubscription error:', err);
@@ -630,7 +656,7 @@ app.get('/api/shop/subscription/:phoneNumber', async (req: Request, res: Respons
 /**
  * POST /api/shop/payment
  * Body: { phoneNumber, paymentReference }
- * Records a payment reference and activates the shop.
+ * Records a payment reference, activates the shop, and resets the 30-day subscription window.
  */
 app.post('/api/shop/payment', async (req: Request, res: Response) => {
   const { phoneNumber, paymentReference } = req.body as {
@@ -644,16 +670,99 @@ app.post('/api/shop/payment', async (req: Request, res: Response) => {
 
   try {
     const { rows } = await pool.query(
-      `UPDATE shops SET has_paid = true, is_active = true, payment_reference = $1
+      `UPDATE shops
+         SET has_paid = true, is_active = true,
+             payment_reference = $1, subscription_paid_at = NOW()
        WHERE owner_phone = $2 RETURNING *`,
       [paymentReference, phoneNumber],
     );
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Shop not found' });
     }
-    return res.json({ success: true, message: 'Payment recorded. Shop activated!', shop: rowToShop(rows[0]) });
+    return res.json({ success: true, message: 'Payment recorded. Shop activated for 30 days!', shop: rowToShop(rows[0]) });
   } catch (err) {
     console.error('recordPayment error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RATING ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/shop/rate
+ * Body: { shopId, customerPhone, rating }
+ * Upserts a rating for a shop by a customer, then recalculates the running average.
+ * One rating per customer per shop (updates if they rate again).
+ */
+app.post('/api/shop/rate', async (req: Request, res: Response) => {
+  const { shopId, customerPhone, rating } = req.body as {
+    shopId?: string;
+    customerPhone?: string;
+    rating?: number;
+  };
+
+  if (!shopId || !customerPhone || typeof rating !== 'number' || rating < 1 || rating > 5) {
+    return res.status(400).json({
+      success: false,
+      message: 'shopId, customerPhone and rating (1–5) are required',
+    });
+  }
+
+  try {
+    // Upsert: insert new rating or update existing one for this customer
+    await pool.query(
+      `INSERT INTO shop_ratings (shop_id, customer_phone, rating)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (shop_id, customer_phone)
+       DO UPDATE SET rating = EXCLUDED.rating, created_at = NOW()`,
+      [shopId, customerPhone, rating],
+    );
+
+    // Recalculate average + count and persist back to the shop row
+    const { rows } = await pool.query(
+      `UPDATE shops
+         SET rating        = (SELECT ROUND(AVG(rating)::numeric, 1) FROM shop_ratings WHERE shop_id = $1),
+             ratings_count = (SELECT COUNT(*)                        FROM shop_ratings WHERE shop_id = $1)
+       WHERE shop_id = $1
+       RETURNING rating, ratings_count`,
+      [shopId],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Shop not found' });
+    }
+
+    return res.json({
+      success:      true,
+      message:      'Rating submitted successfully',
+      newRating:    rows[0].rating,
+      ratingsCount: rows[0].ratings_count,
+    });
+  } catch (err) {
+    console.error('submitShopRating error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+/**
+ * GET /api/shop/myrating/:shopId/:customerPhone
+ * Returns the rating this customer has previously submitted for a shop (if any).
+ */
+app.get('/api/shop/myrating/:shopId/:customerPhone', async (req: Request, res: Response) => {
+  const { shopId, customerPhone } = req.params;
+  try {
+    const { rows } = await pool.query(
+      'SELECT rating FROM shop_ratings WHERE shop_id = $1 AND customer_phone = $2',
+      [shopId, customerPhone],
+    );
+    return res.json({
+      success:   true,
+      myRating:  rows.length > 0 ? rows[0].rating : null,
+    });
+  } catch (err) {
+    console.error('getMyRating error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
