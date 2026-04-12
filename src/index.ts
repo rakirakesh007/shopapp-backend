@@ -624,9 +624,13 @@ app.get('/api/shop/subscription/:phoneNumber', async (req: Request, res: Respons
     const now = new Date();
 
     // ── Trial window (7 days) ─────────────────────────────────────────
+    // Use date-only comparison (strip time) so a user who signs up today
+    // gets the FULL 7 days, not "0 days left" because of time-of-day offset.
     const trialStart      = new Date(shop.trial_start_date);
-    const daysSinceTrial  = Math.floor((now.getTime() - trialStart.getTime()) / (1000 * 60 * 60 * 24));
-    const trialExpired    = daysSinceTrial > 7;
+    const trialStartDay   = new Date(trialStart.getFullYear(), trialStart.getMonth(), trialStart.getDate());
+    const todayDay        = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const daysSinceTrial  = Math.floor((todayDay.getTime() - trialStartDay.getTime()) / (1000 * 60 * 60 * 24));
+    const trialExpired    = daysSinceTrial >= 7;
     const trialDaysLeft   = Math.max(0, 7 - daysSinceTrial);
 
     // ── Paid subscription window (30 days from last payment) ──────────
