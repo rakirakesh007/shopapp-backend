@@ -23,9 +23,15 @@ export async function initDb(): Promise<void> {
       is_setup_complete BOOLEAN      NOT NULL DEFAULT false,
       name              VARCHAR(100),
       latitude          DOUBLE PRECISION,
-      longitude         DOUBLE PRECISION
+      longitude         DOUBLE PRECISION,
+      pin               VARCHAR(4)
     )
   `);
+
+  // Add pin column to existing users rows (migration for older databases)
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pin VARCHAR(4)`);
+  } catch (_) { /* column already exists */ }
 
   // Create shops table
   await pool.query(`
@@ -137,9 +143,9 @@ export async function initDb(): Promise<void> {
   const { rowCount: userCount } = await pool.query('SELECT 1 FROM users LIMIT 1');
   if (!userCount) {
     await pool.query(`
-      INSERT INTO users (phone_number, role, user_id, is_setup_complete, name) VALUES
-      ('9876543210', 'owner',    'u_101', true, 'Sharma Ji'),
-      ('1234567890', 'customer', 'u_102', true, 'Rahul Kumar')
+      INSERT INTO users (phone_number, role, user_id, is_setup_complete, name, pin) VALUES
+      ('9876543210', 'owner',    'u_101', true, 'Sharma Ji',    '1234'),
+      ('1234567890', 'customer', 'u_102', true, 'Rahul Kumar', '1234')
     `);
     console.log('📦  Seeded 2 users');
   }

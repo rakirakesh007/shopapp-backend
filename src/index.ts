@@ -32,10 +32,13 @@ app.get('/', (_req: Request, res: Response) => {
  * Looks up the user in the PostgreSQL `users` table.
  */
 app.post('/api/login', async (req: Request, res: Response) => {
-  const { phoneNumber } = req.body as { phoneNumber?: string };
+  const { phoneNumber, pin } = req.body as { phoneNumber?: string; pin?: string };
 
   if (!phoneNumber) {
     return res.status(400).json({ success: false, message: 'phoneNumber is required' });
+  }
+  if (!pin || !/^\d{4}$/.test(pin)) {
+    return res.status(400).json({ success: false, message: 'A 4-digit PIN is required' });
   }
 
   try {
@@ -46,6 +49,15 @@ app.post('/api/login', async (req: Request, res: Response) => {
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'User not found. Please register.' });
     }
+
+    const user = rows[0];
+    if (user.pin === null || user.pin === undefined || user.pin === '') {
+      // User registered before PIN feature — auto-set their PIN (migration)
+      await pool.query('UPDATE users SET pin = $1 WHERE phone_number = $2', [pin, phoneNumber]);
+    } else if (user.pin !== pin) {
+      return res.status(401).json({ success: false, message: 'Incorrect PIN. Please try again.' });
+    }
+
     return res.json({ success: true, message: 'Login successful', user: rowToUser(rows[0]) });
   } catch (err) {
     console.error('login error:', err);
@@ -60,12 +72,13 @@ app.post('/api/login', async (req: Request, res: Response) => {
  * If role is 'owner', also inserts a default row into `shops`.
  */
 app.post('/api/register', async (req: Request, res: Response) => {
-  const { name, phoneNumber, role, latitude, longitude } = req.body as {
+  const { name, phoneNumber, role, latitude, longitude, pin } = req.body as {
     name?: string;
     phoneNumber?: string;
     role?: 'owner' | 'customer';
     latitude?: number;
     longitude?: number;
+    pin?: string;
   };
 
   if (!phoneNumber || !role) {
@@ -73,6 +86,9 @@ app.post('/api/register', async (req: Request, res: Response) => {
   }
   if (role !== 'owner' && role !== 'customer') {
     return res.status(400).json({ success: false, message: 'role must be owner or customer' });
+  }
+  if (!pin || !/^\d{4}$/.test(pin)) {
+    return res.status(400).json({ success: false, message: 'A 4-digit numeric PIN is required' });
   }
 
   try {
@@ -83,9 +99,9 @@ app.post('/api/register', async (req: Request, res: Response) => {
 
     const userId = `u_${Date.now()}`;
     await pool.query(
-      `INSERT INTO users (phone_number, role, user_id, is_setup_complete, name, latitude, longitude)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [phoneNumber, role, userId, true, name ?? '', latitude ?? null, longitude ?? null],
+      `INSERT INTO users (phone_number, role, user_id, is_setup_complete, name, latitude, longitude, pin)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [phoneNumber, role, userId, true, name ?? '', latitude ?? null, longitude ?? null, pin],
     );
 
     if (role === 'owner') {
