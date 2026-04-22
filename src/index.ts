@@ -2,7 +2,8 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-import { pool, initDb, rowToUser, rowToShop, rowToProduct, rowToOrder } from './db';
+import { connectDb, seedDb, User, Shop, Product, Order, ShopRating,
+         docToUser, docToShop, docToProduct, docToOrder } from './db';
 
 dotenv.config();
 
@@ -14,9 +15,6 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// ── Types ──────────────────────────────────────────────────────────────────────
-// (kept for request-body typing only — DB returns are mapped by rowToUser/rowToShop)
-
 // ── Health check ───────────────────────────────────────────────────────────────
 app.get('/', (_req: Request, res: Response) => {
   res.json({ status: 'ok', message: 'ShopApp API is running 🚀' });
@@ -26,11 +24,6 @@ app.get('/', (_req: Request, res: Response) => {
 // AUTH ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * POST /api/login
- * Body: { phoneNumber: string }
- * Looks up the user in the PostgreSQL `users` table.
- */
 app.post('/api/login', async (req: Request, res: Response) => {
   const { phoneNumber, pin } = req.body as { phoneNumber?: string; pin?: string };
 
@@ -42,43 +35,29 @@ app.post('/api/login', async (req: Request, res: Response) => {
   }
 
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM users WHERE phone_number = $1',
-      [phoneNumber],
-    );
-    if (rows.length === 0) {
+    const user = await User.findOne({ phoneNumber });
+    if (!user) {
       return res.status(404).json({ success: false, message: 'User not found. Please register.' });
     }
 
-    const user = rows[0];
-    if (user.pin === null || user.pin === undefined || user.pin === '') {
-      // User registered before PIN feature — auto-set their PIN (migration)
-      await pool.query('UPDATE users SET pin = $1 WHERE phone_number = $2', [pin, phoneNumber]);
+    if (!user.pin) {
+      user.pin = pin;
+      await user.save();
     } else if (user.pin !== pin) {
       return res.status(401).json({ success: false, message: 'Incorrect PIN. Please try again.' });
     }
 
-    return res.json({ success: true, message: 'Login successful', user: rowToUser(rows[0]) });
+    return res.json({ success: true, message: 'Login successful', user: docToUser(user) });
   } catch (err) {
     console.error('login error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * POST /api/register
- * Body: { name?, phoneNumber, role, latitude?, longitude? }
- * Inserts a new row into `users`.
- * If role is 'owner', also inserts a default row into `shops`.
- */
 app.post('/api/register', async (req: Request, res: Response) => {
   const { name, phoneNumber, role, latitude, longitude, pin } = req.body as {
-    name?: string;
-    phoneNumber?: string;
-    role?: 'owner' | 'customer';
-    latitude?: number;
-    longitude?: number;
-    pin?: string;
+    name?: string; phoneNumber?: string; role?: 'owner' | 'customer';
+    latitude?: number; longitude?: number; pin?: string;
   };
 
   if (!phoneNumber || !role) {
@@ -92,25 +71,26 @@ app.post('/api/register', async (req: Request, res: Response) => {
   }
 
   try {
-    const existing = await pool.query('SELECT 1 FROM users WHERE phone_number = $1', [phoneNumber]);
-    if (existing.rowCount && existing.rowCount > 0) {
+    const existing = await User.findOne({ phoneNumber });
+    if (existing) {
       return res.status(409).json({ success: false, message: 'User already registered' });
     }
 
     const userId = `u_${Date.now()}`;
-    await pool.query(
-      `INSERT INTO users (phone_number, role, user_id, is_setup_complete, name, latitude, longitude, pin)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [phoneNumber, role, userId, true, name ?? '', latitude ?? null, longitude ?? null, pin],
-    );
+    await User.create({
+      phoneNumber, role, userId, isSetupComplete: true,
+      name: name ?? '', latitude: latitude ?? undefined, longitude: longitude ?? undefined, pin,
+    });
 
     if (role === 'owner') {
-      await pool.query(
-        `INSERT INTO shops
-           (shop_id, owner_id, shop_name, area, category, is_open, rating, owner_phone, shop_address, owner_specialization, latitude, longitude, trial_start_date, is_active, has_paid)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), true, false)`,
-        [`s_${Date.now()}`, userId, name ? `${name}'s Shop` : 'New Shop', '', 'General', false, 0, phoneNumber, '', '', latitude ?? null, longitude ?? null],
-      );
+      await Shop.create({
+        shopId: `s_${Date.now()}`, ownerId: userId,
+        shopName: name ? `${name}'s Shop` : 'New Shop',
+        area: '', category: 'General', isOpen: false, rating: 0,
+        ownerPhone: phoneNumber, shopAddress: '', ownerSpecialization: '',
+        latitude: latitude ?? undefined, longitude: longitude ?? undefined,
+        trialStartDate: new Date(), isActive: true, hasPaid: false,
+      });
     }
 
     const newUser = { phoneNumber, role, userId, isSetupComplete: true, name: name ?? '' };
@@ -125,98 +105,61 @@ app.post('/api/register', async (req: Request, res: Response) => {
 // SHOP ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * GET /api/shops
- * Query params: lat, lng, radius (km, default 10)
- * Returns nearby shops if lat/lng provided, else all shops.
- * Only returns active shops (is_active = true).
- */
 app.get('/api/shops', async (req: Request, res: Response) => {
   try {
     const lat = parseFloat(req.query.lat as string);
     const lng = parseFloat(req.query.lng as string);
     const radiusKm = parseFloat(req.query.radius as string) || 10;
 
-    let rows;
+    let shopDocs;
     if (!isNaN(lat) && !isNaN(lng)) {
-      // Haversine formula in SQL to calculate distance in km
-      const result = await pool.query(
-        `SELECT *,
-           ( 6371 * acos(
-               LEAST(1.0, cos(radians($1)) * cos(radians(latitude))
-               * cos(radians(longitude) - radians($2))
-               + sin(radians($1)) * sin(radians(latitude)))
-           )) AS distance_km
-         FROM shops
-         WHERE is_active = true
-           AND latitude IS NOT NULL AND longitude IS NOT NULL
-         HAVING ( 6371 * acos(
-               LEAST(1.0, cos(radians($1)) * cos(radians(latitude))
-               * cos(radians(longitude) - radians($2))
-               + sin(radians($1)) * sin(radians(latitude)))
-           )) <= $3
-         ORDER BY distance_km`,
-        [lat, lng, radiusKm],
-      );
-      rows = result.rows;
-    } else {
-      const result = await pool.query(
-        'SELECT * FROM shops WHERE is_active = true ORDER BY shop_name',
-      );
-      rows = result.rows;
-    }
+      // Get all active shops with coordinates, then filter by Haversine in JS
+      shopDocs = await Shop.find({ isActive: true, latitude: { $ne: null }, longitude: { $ne: null } });
+      const toRad = (d: number) => (d * Math.PI) / 180;
+      const withDist = shopDocs
+        .map((s: any) => {
+          const dLat = toRad(s.latitude! - lat);
+          const dLng = toRad(s.longitude! - lng);
+          const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat)) * Math.cos(toRad(s.latitude!)) * Math.sin(dLng / 2) ** 2;
+          const dist = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+          return { doc: s, distanceKm: Math.round(dist * 10) / 10 };
+        })
+        .filter((s: any) => s.distanceKm <= radiusKm)
+        .sort((a: any, b: any) => a.distanceKm - b.distanceKm);
 
-    const shops = rows.map((r: any) => {
-      const s = rowToShop(r);
-      return { ...s, distanceKm: r.distance_km ? Math.round(r.distance_km * 10) / 10 : null };
-    });
-    return res.json({ success: true, shops });
+      const shops = withDist.map((s: any) => ({ ...docToShop(s.doc), distanceKm: s.distanceKm }));
+      return res.json({ success: true, shops });
+    } else {
+      shopDocs = await Shop.find({ isActive: true }).sort({ shopName: 1 });
+      const shops = shopDocs.map((s: any) => ({ ...docToShop(s), distanceKm: null }));
+      return res.json({ success: true, shops });
+    }
   } catch (err) {
     console.error('getAllShops error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * GET /api/shop/:phoneNumber
- * Returns the shop linked to the given owner phone number.
- */
 app.get('/api/shop/:phoneNumber', async (req: Request, res: Response) => {
   const { phoneNumber } = req.params;
-
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM shops WHERE owner_phone = $1',
-      [phoneNumber],
-    );
-    if (rows.length === 0) {
+    const shop = await Shop.findOne({ ownerPhone: phoneNumber });
+    if (!shop) {
       return res.status(404).json({ success: false, message: 'Shop not found for this phone number' });
     }
-    return res.json({ success: true, shop: rowToShop(rows[0]) });
+    return res.json({ success: true, shop: docToShop(shop) });
   } catch (err) {
     console.error('getShop error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * PATCH /api/shop/details
- * Body: { phoneNumber, shopName?, category?, shopAddress?, ownerSpecialization?, ownerName? }
- * Updates the shop's display details (called from ShopSetupPage / ProfilePage).
- * Also updates the owner's name in the users table if ownerName is supplied.
- */
 app.patch('/api/shop/details', async (req: Request, res: Response) => {
   const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName, latitude, longitude, deliveryCharge } =
     req.body as {
-      phoneNumber?: string;
-      shopName?: string;
-      category?: string;
-      shopAddress?: string;
-      ownerSpecialization?: string;
-      ownerName?: string;
-      latitude?: number;
-      longitude?: number;
-      deliveryCharge?: number;
+      phoneNumber?: string; shopName?: string; category?: string;
+      shopAddress?: string; ownerSpecialization?: string; ownerName?: string;
+      latitude?: number; longitude?: number; deliveryCharge?: number;
     };
 
   if (!phoneNumber) {
@@ -224,41 +167,32 @@ app.patch('/api/shop/details', async (req: Request, res: Response) => {
   }
 
   try {
-    // Check for duplicate shop_name + shop_address (only if both provided and non-empty)
     if (shopName && shopAddress && shopAddress.trim() !== '') {
-      const dup = await pool.query(
-        `SELECT shop_id FROM shops WHERE LOWER(shop_name) = LOWER($1) AND LOWER(shop_address) = LOWER($2) AND owner_phone <> $3`,
-        [shopName, shopAddress, phoneNumber],
-      );
-      if (dup.rowCount && dup.rowCount > 0) {
+      const dup = await Shop.findOne({
+        shopName: { $regex: new RegExp(`^${shopName}$`, 'i') },
+        shopAddress: { $regex: new RegExp(`^${shopAddress}$`, 'i') },
+        ownerPhone: { $ne: phoneNumber },
+      });
+      if (dup) {
         return res.status(409).json({ success: false, message: 'A shop with this name and address already exists' });
       }
     }
 
-    const sets: string[] = [];
-    const vals: (string | number | null)[] = [];
-    let i = 1;
-    if (shopName !== undefined)             { sets.push(`shop_name = $${i++}`);             vals.push(shopName); }
-    if (category !== undefined)             { sets.push(`category = $${i++}`);              vals.push(category); }
-    if (shopAddress !== undefined)          { sets.push(`shop_address = $${i++}`);          vals.push(shopAddress); }
-    if (ownerSpecialization !== undefined)  { sets.push(`owner_specialization = $${i++}`);  vals.push(ownerSpecialization); }
-    if (latitude !== undefined)             { sets.push(`latitude = $${i++}`);              vals.push(latitude); }
-    if (longitude !== undefined)            { sets.push(`longitude = $${i++}`);             vals.push(longitude); }
-    if (deliveryCharge !== undefined)       { sets.push(`delivery_charge = $${i++}`);       vals.push(deliveryCharge); }
+    const update: any = {};
+    if (shopName !== undefined)            update.shopName = shopName;
+    if (category !== undefined)            update.category = category;
+    if (shopAddress !== undefined)         update.shopAddress = shopAddress;
+    if (ownerSpecialization !== undefined)  update.ownerSpecialization = ownerSpecialization;
+    if (latitude !== undefined)            update.latitude = latitude;
+    if (longitude !== undefined)           update.longitude = longitude;
+    if (deliveryCharge !== undefined)       update.deliveryCharge = deliveryCharge;
 
-    if (sets.length > 0) {
-      vals.push(phoneNumber);
-      await pool.query(
-        `UPDATE shops SET ${sets.join(', ')} WHERE owner_phone = $${i}`,
-        vals,
-      );
+    if (Object.keys(update).length > 0) {
+      await Shop.updateOne({ ownerPhone: phoneNumber }, { $set: update });
     }
 
     if (ownerName !== undefined) {
-      await pool.query(
-        'UPDATE users SET name = $1 WHERE phone_number = $2',
-        [ownerName, phoneNumber],
-      );
+      await User.updateOne({ phoneNumber }, { $set: { name: ownerName } });
     }
 
     return res.json({ success: true, message: 'Shop details updated' });
@@ -268,18 +202,13 @@ app.patch('/api/shop/details', async (req: Request, res: Response) => {
   }
 });
 
-/**
- * PATCH /api/user/name
- * Body: { phoneNumber, name }
- * Updates the name field for any user (owner or customer).
- */
 app.patch('/api/user/name', async (req: Request, res: Response) => {
   const { phoneNumber, name } = req.body as { phoneNumber?: string; name?: string };
   if (!phoneNumber || !name) {
     return res.status(400).json({ success: false, message: 'phoneNumber and name are required' });
   }
   try {
-    await pool.query('UPDATE users SET name = $1 WHERE phone_number = $2', [name, phoneNumber]);
+    await User.updateOne({ phoneNumber }, { $set: { name } });
     return res.json({ success: true, message: 'User name updated' });
   } catch (err) {
     console.error('updateUserName error:', err);
@@ -287,35 +216,40 @@ app.patch('/api/user/name', async (req: Request, res: Response) => {
   }
 });
 
-/**
- * PATCH /api/shop/status
- * Body: { phoneNumber: string, isOpen: boolean }
- * Updates the is_open flag in the `shops` table and returns the updated row.
- */
+app.patch('/api/user/address', async (req: Request, res: Response) => {
+  const { phoneNumber, address } = req.body as { phoneNumber?: string; address?: string };
+  if (!phoneNumber || !address) {
+    return res.status(400).json({ success: false, message: 'phoneNumber and address are required' });
+  }
+  try {
+    await User.updateOne({ phoneNumber }, { $set: { address } });
+    return res.json({ success: true, message: 'User address updated' });
+  } catch (err) {
+    console.error('updateUserAddress error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
 app.patch('/api/shop/status', async (req: Request, res: Response) => {
-  const { phoneNumber, isOpen } = req.body as {
-    phoneNumber?: string;
-    isOpen?: boolean;
-  };
+  const { phoneNumber, isOpen } = req.body as { phoneNumber?: string; isOpen?: boolean };
 
   if (!phoneNumber || typeof isOpen !== 'boolean') {
-    return res
-      .status(400)
-      .json({ success: false, message: 'phoneNumber (string) and isOpen (boolean) are required' });
+    return res.status(400).json({ success: false, message: 'phoneNumber (string) and isOpen (boolean) are required' });
   }
 
   try {
-    const { rows } = await pool.query(
-      'UPDATE shops SET is_open = $1 WHERE owner_phone = $2 RETURNING *',
-      [isOpen, phoneNumber],
+    const shop = await Shop.findOneAndUpdate(
+      { ownerPhone: phoneNumber },
+      { $set: { isOpen } },
+      { new: true },
     );
-    if (rows.length === 0) {
+    if (!shop) {
       return res.status(404).json({ success: false, message: 'Shop not found' });
     }
     return res.json({
       success: true,
       message: `Shop is now ${isOpen ? 'Open 🟢' : 'Closed 🔴'}`,
-      shop: rowToShop(rows[0]),
+      shop: docToShop(shop),
     });
   } catch (err) {
     console.error('toggleStatus error:', err);
@@ -327,29 +261,17 @@ app.patch('/api/shop/status', async (req: Request, res: Response) => {
 // PRODUCT ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * GET /api/products/:shopId
- * Returns all products belonging to a shop.
- */
 app.get('/api/products/:shopId', async (req: Request, res: Response) => {
   const { shopId } = req.params;
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM products WHERE shop_id = $1 ORDER BY name',
-      [shopId],
-    );
-    return res.json({ success: true, products: rows.map(rowToProduct) });
+    const products = await Product.find({ shopId }).sort({ name: 1 });
+    return res.json({ success: true, products: products.map(docToProduct) });
   } catch (err) {
     console.error('getProducts error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * PATCH /api/products/:productId/stock
- * Body: { stock: number }
- * Updates the stock count for a product.
- */
 app.patch('/api/products/:productId/stock', async (req: Request, res: Response) => {
   const { productId } = req.params;
   const { stock } = req.body as { stock?: number };
@@ -358,25 +280,21 @@ app.patch('/api/products/:productId/stock', async (req: Request, res: Response) 
     return res.status(400).json({ success: false, message: 'stock (non-negative number) is required' });
   }
   try {
-    const { rows } = await pool.query(
-      'UPDATE products SET stock = $1 WHERE product_id = $2 RETURNING *',
-      [stock, productId],
+    const product = await Product.findOneAndUpdate(
+      { productId },
+      { $set: { stock } },
+      { new: true },
     );
-    if (rows.length === 0) {
+    if (!product) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
-    return res.json({ success: true, product: rowToProduct(rows[0]) });
+    return res.json({ success: true, product: docToProduct(product) });
   } catch (err) {
     console.error('updateStock error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * POST /api/products
- * Body: { shopId, name, category, price, stock, minStock, unit?, imageUrl? }
- * Creates a new product for a shop.
- */
 app.post('/api/products', async (req: Request, res: Response) => {
   const { shopId, name, category, price, stock, minStock, unit, imageUrl } = req.body as {
     shopId?: string; name?: string; category?: string;
@@ -389,23 +307,17 @@ app.post('/api/products', async (req: Request, res: Response) => {
   }
   try {
     const productId = `p_${Date.now()}`;
-    const { rows } = await pool.query(
-      `INSERT INTO products (product_id, shop_id, name, category, price, stock, min_stock, unit, image_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [productId, shopId, name, category, price, stock, minStock, unit ?? 'pcs', imageUrl ?? ''],
-    );
-    return res.status(201).json({ success: true, product: rowToProduct(rows[0]) });
+    const product = await Product.create({
+      productId, shopId, name, category, price, stock, minStock,
+      unit: unit ?? 'pcs', imageUrl: imageUrl ?? '',
+    });
+    return res.status(201).json({ success: true, product: docToProduct(product) });
   } catch (err) {
     console.error('addProduct error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * PATCH /api/products/:productId
- * Body: { name?, category?, price?, stock?, minStock?, unit?, imageUrl? }
- * Updates product details (full edit — separate from stock-only PATCH).
- */
 app.patch('/api/products/:productId', async (req: Request, res: Response) => {
   const { productId } = req.params;
   const { name, category, price, stock, minStock, unit, imageUrl } = req.body as {
@@ -418,44 +330,35 @@ app.patch('/api/products/:productId', async (req: Request, res: Response) => {
   }
 
   try {
-    const sets: string[] = [];
-    const vals: (string | number)[] = [];
-    let i = 1;
-    if (name      !== undefined) { sets.push(`name = $${i++}`);       vals.push(name); }
-    if (category  !== undefined) { sets.push(`category = $${i++}`);   vals.push(category); }
-    if (price     !== undefined) { sets.push(`price = $${i++}`);      vals.push(price); }
-    if (stock     !== undefined) { sets.push(`stock = $${i++}`);      vals.push(stock); }
-    if (minStock  !== undefined) { sets.push(`min_stock = $${i++}`);  vals.push(minStock); }
-    if (unit      !== undefined) { sets.push(`unit = $${i++}`);       vals.push(unit); }
-    if (imageUrl  !== undefined) { sets.push(`image_url = $${i++}`);  vals.push(imageUrl); }
-    vals.push(productId);
+    const update: any = {};
+    if (name     !== undefined) update.name     = name;
+    if (category !== undefined) update.category = category;
+    if (price    !== undefined) update.price    = price;
+    if (stock    !== undefined) update.stock    = stock;
+    if (minStock !== undefined) update.minStock = minStock;
+    if (unit     !== undefined) update.unit     = unit;
+    if (imageUrl !== undefined) update.imageUrl = imageUrl;
 
-    const { rows } = await pool.query(
-      `UPDATE products SET ${sets.join(', ')} WHERE product_id = $${i} RETURNING *`,
-      vals,
+    const product = await Product.findOneAndUpdate(
+      { productId },
+      { $set: update },
+      { new: true },
     );
-    if (rows.length === 0) {
+    if (!product) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
-    return res.json({ success: true, product: rowToProduct(rows[0]) });
+    return res.json({ success: true, product: docToProduct(product) });
   } catch (err) {
     console.error('updateProduct error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * DELETE /api/products/:productId
- * Removes a product from the database.
- */
 app.delete('/api/products/:productId', async (req: Request, res: Response) => {
   const { productId } = req.params;
   try {
-    const { rowCount } = await pool.query(
-      'DELETE FROM products WHERE product_id = $1',
-      [productId],
-    );
-    if (rowCount === 0) {
+    const result = await Product.deleteOne({ productId });
+    if (result.deletedCount === 0) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
     return res.json({ success: true, message: 'Product deleted' });
@@ -469,13 +372,6 @@ app.delete('/api/products/:productId', async (req: Request, res: Response) => {
 // ORDER ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * POST /api/orders
- * Body: { customerName, customerPhone, shopId, shopName, ownerPhone,
- *         totalAmount, deliveryType, deliveryAddress?, estimatedPickupTime?,
- *         items: [{ name, qty, price }] }
- * Creates a new order with its items.
- */
 app.post('/api/orders', async (req: Request, res: Response) => {
   const { customerName, customerPhone, shopId, shopName, ownerPhone,
           totalAmount, deliveryType, deliveryAddress, estimatedPickupTime, items } = req.body as {
@@ -491,65 +387,33 @@ app.post('/api/orders', async (req: Request, res: Response) => {
     return res.status(400).json({ success: false, message: 'Missing required order fields' });
   }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
     const orderId = `ord_${Date.now()}`;
-    await client.query(
-      `INSERT INTO orders
-         (order_id, customer_name, customer_phone, shop_id, shop_name, owner_phone,
-          total_amount, delivery_type, delivery_address, estimated_pickup_time)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [orderId, customerName, customerPhone, shopId, shopName, ownerPhone,
-       totalAmount, deliveryType, deliveryAddress ?? null, estimatedPickupTime ?? null],
-    );
-    for (const item of items) {
-      await client.query(
-        'INSERT INTO order_items (order_id, name, qty, price) VALUES ($1,$2,$3,$4)',
-        [orderId, item.name, item.qty, item.price],
-      );
-    }
-    await client.query('COMMIT');
+    await Order.create({
+      orderId, customerName, customerPhone, shopId, shopName, ownerPhone,
+      totalAmount, deliveryType,
+      deliveryAddress: deliveryAddress ?? undefined,
+      estimatedPickupTime: estimatedPickupTime ?? undefined,
+      items,
+    });
     return res.status(201).json({ success: true, orderId, message: 'Order placed successfully' });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('placeOrder error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
-  } finally {
-    client.release();
   }
 });
 
-/**
- * GET /api/orders/shop/:ownerPhone
- * Returns all orders for a shop (owner view), most recent first.
- */
 app.get('/api/orders/shop/:ownerPhone', async (req: Request, res: Response) => {
   const { ownerPhone } = req.params;
   try {
-    const { rows: orderRows } = await pool.query(
-      'SELECT * FROM orders WHERE owner_phone = $1 ORDER BY created_at DESC',
-      [ownerPhone],
-    );
-    const orders = await Promise.all(orderRows.map(async (o) => {
-      const { rows: itemRows } = await pool.query(
-        'SELECT * FROM order_items WHERE order_id = $1',
-        [o.order_id],
-      );
-      return rowToOrder(o, itemRows);
-    }));
-    return res.json({ success: true, orders });
+    const orders = await Order.find({ ownerPhone }).sort({ createdAt: -1 });
+    return res.json({ success: true, orders: orders.map(docToOrder) });
   } catch (err) {
     console.error('getShopOrders error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * PATCH /api/orders/:orderId/status
- * Body: { status: 'newOrder' | 'preparing' | 'ready' | 'completed' }
- * Advances an order's status.
- */
 app.patch('/api/orders/:orderId/status', async (req: Request, res: Response) => {
   const { orderId } = req.params;
   const { status } = req.body as { status?: string };
@@ -559,39 +423,26 @@ app.patch('/api/orders/:orderId/status', async (req: Request, res: Response) => 
     return res.status(400).json({ success: false, message: `status must be one of: ${valid.join(', ')}` });
   }
   try {
-    const { rows } = await pool.query(
-      'UPDATE orders SET status = $1 WHERE order_id = $2 RETURNING *',
-      [status, orderId],
+    const order = await Order.findOneAndUpdate(
+      { orderId },
+      { $set: { status } },
+      { new: true },
     );
-    if (rows.length === 0) {
+    if (!order) {
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
-    return res.json({ success: true, message: `Order is now "${status}"`, order: rowToOrder(rows[0]) });
+    return res.json({ success: true, message: `Order is now "${status}"`, order: docToOrder(order) });
   } catch (err) {
     console.error('updateOrderStatus error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * GET /api/orders/customer/:phone
- * Returns all orders placed by a customer, most recent first.
- */
 app.get('/api/orders/customer/:phone', async (req: Request, res: Response) => {
   const { phone } = req.params;
   try {
-    const { rows: orderRows } = await pool.query(
-      'SELECT * FROM orders WHERE customer_phone = $1 ORDER BY created_at DESC',
-      [phone],
-    );
-    const orders = await Promise.all(orderRows.map(async (o) => {
-      const { rows: itemRows } = await pool.query(
-        'SELECT * FROM order_items WHERE order_id = $1',
-        [o.order_id],
-      );
-      return rowToOrder(o, itemRows);
-    }));
-    return res.json({ success: true, orders });
+    const orders = await Order.find({ customerPhone: phone }).sort({ createdAt: -1 });
+    return res.json({ success: true, orders: orders.map(docToOrder) });
   } catch (err) {
     console.error('getCustomerOrders error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
@@ -602,70 +453,51 @@ app.get('/api/orders/customer/:phone', async (req: Request, res: Response) => {
 // SUBSCRIPTION / TRIAL ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * GET /api/shop/subscription/:phoneNumber
- * Returns subscription status for the shop owner.
- * Logic:
- *   • 7-day free trial from trial_start_date.
- *   • After paying, subscription valid for 30 days from subscription_paid_at.
- *   • If neither is active, deactivate the shop automatically.
- */
 app.get('/api/shop/subscription/:phoneNumber', async (req: Request, res: Response) => {
   const { phoneNumber } = req.params;
   try {
-    const { rows } = await pool.query(
-      'SELECT trial_start_date, is_active, has_paid, payment_reference, subscription_paid_at FROM shops WHERE owner_phone = $1',
-      [phoneNumber],
-    );
-    if (rows.length === 0) {
+    const shop = await Shop.findOne({ ownerPhone: phoneNumber });
+    if (!shop) {
       return res.status(404).json({ success: false, message: 'Shop not found' });
     }
-    const shop = rows[0];
     const now = new Date();
 
-    // ── Trial window (7 days) ─────────────────────────────────────────
-    // Use date-only comparison (strip time) so a user who signs up today
-    // gets the FULL 7 days, not "0 days left" because of time-of-day offset.
-    const trialStart      = new Date(shop.trial_start_date);
-    const trialStartDay   = new Date(trialStart.getFullYear(), trialStart.getMonth(), trialStart.getDate());
-    const todayDay        = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const daysSinceTrial  = Math.floor((todayDay.getTime() - trialStartDay.getTime()) / (1000 * 60 * 60 * 24));
-    const trialExpired    = daysSinceTrial >= 7;
-    const trialDaysLeft   = Math.max(0, 7 - daysSinceTrial);
+    const trialStart    = new Date(shop.trialStartDate);
+    const trialStartDay = new Date(trialStart.getFullYear(), trialStart.getMonth(), trialStart.getDate());
+    const todayDay      = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const daysSinceTrial = Math.floor((todayDay.getTime() - trialStartDay.getTime()) / (1000 * 60 * 60 * 24));
+    const trialExpired   = daysSinceTrial >= 7;
+    const trialDaysLeft  = Math.max(0, 7 - daysSinceTrial);
 
-    // ── Paid subscription window (30 days from last payment) ──────────
     let subscriptionExpired = true;
     let subDaysLeft         = 0;
-    if (shop.subscription_paid_at) {
-      const paidAt          = new Date(shop.subscription_paid_at);
+    if (shop.subscriptionPaidAt) {
+      const paidAt           = new Date(shop.subscriptionPaidAt);
       const daysSincePayment = Math.floor((now.getTime() - paidAt.getTime()) / (1000 * 60 * 60 * 24));
-      subscriptionExpired   = daysSincePayment > 30;
-      subDaysLeft           = Math.max(0, 30 - daysSincePayment);
+      subscriptionExpired    = daysSincePayment > 30;
+      subDaysLeft            = Math.max(0, 30 - daysSincePayment);
     }
 
-    // Shop is active if either in trial OR paid subscription is still valid
-    const isActive = (!trialExpired) || (shop.has_paid && !subscriptionExpired);
+    const isActive = (!trialExpired) || (shop.hasPaid && !subscriptionExpired);
 
-    // Auto-deactivate if neither window is active
-    if (!isActive && shop.is_active) {
-      await pool.query('UPDATE shops SET is_active = false WHERE owner_phone = $1', [phoneNumber]);
+    if (!isActive && shop.isActive) {
+      await Shop.updateOne({ ownerPhone: phoneNumber }, { $set: { isActive: false } });
     }
-    // Re-activate if payment is recent (e.g. payment was just recorded)
-    if (isActive && !shop.is_active) {
-      await pool.query('UPDATE shops SET is_active = true WHERE owner_phone = $1', [phoneNumber]);
+    if (isActive && !shop.isActive) {
+      await Shop.updateOne({ ownerPhone: phoneNumber }, { $set: { isActive: true } });
     }
 
     return res.json({
       success:              true,
-      trialStartDate:       shop.trial_start_date,
+      trialStartDate:       shop.trialStartDate,
       trialDaysRemaining:   trialDaysLeft,
       trialExpired,
-      hasPaid:              shop.has_paid,
-      subscriptionPaidAt:   shop.subscription_paid_at ?? null,
+      hasPaid:              shop.hasPaid,
+      subscriptionPaidAt:   shop.subscriptionPaidAt ?? null,
       subscriptionDaysRemaining: subDaysLeft,
       subscriptionExpired,
       isActive,
-      paymentReference:     shop.payment_reference,
+      paymentReference:     shop.paymentReference,
     });
   } catch (err) {
     console.error('getSubscription error:', err);
@@ -673,15 +505,9 @@ app.get('/api/shop/subscription/:phoneNumber', async (req: Request, res: Respons
   }
 });
 
-/**
- * POST /api/shop/payment
- * Body: { phoneNumber, paymentReference }
- * Records a payment reference, activates the shop, and resets the 30-day subscription window.
- */
 app.post('/api/shop/payment', async (req: Request, res: Response) => {
   const { phoneNumber, paymentReference } = req.body as {
-    phoneNumber?: string;
-    paymentReference?: string;
+    phoneNumber?: string; paymentReference?: string;
   };
 
   if (!phoneNumber || !paymentReference) {
@@ -689,17 +515,15 @@ app.post('/api/shop/payment', async (req: Request, res: Response) => {
   }
 
   try {
-    const { rows } = await pool.query(
-      `UPDATE shops
-         SET has_paid = true, is_active = true,
-             payment_reference = $1, subscription_paid_at = NOW()
-       WHERE owner_phone = $2 RETURNING *`,
-      [paymentReference, phoneNumber],
+    const shop = await Shop.findOneAndUpdate(
+      { ownerPhone: phoneNumber },
+      { $set: { hasPaid: true, isActive: true, paymentReference, subscriptionPaidAt: new Date() } },
+      { new: true },
     );
-    if (rows.length === 0) {
+    if (!shop) {
       return res.status(404).json({ success: false, message: 'Shop not found' });
     }
-    return res.json({ success: true, message: 'Payment recorded. Shop activated for 30 days!', shop: rowToShop(rows[0]) });
+    return res.json({ success: true, message: 'Payment recorded. Shop activated for 30 days!', shop: docToShop(shop) });
   } catch (err) {
     console.error('recordPayment error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
@@ -710,77 +534,46 @@ app.post('/api/shop/payment', async (req: Request, res: Response) => {
 // RATING ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * POST /api/shop/rate
- * Body: { shopId, customerPhone, rating }
- * Upserts a rating for a shop by a customer, then recalculates the running average.
- * One rating per customer per shop (updates if they rate again).
- */
 app.post('/api/shop/rate', async (req: Request, res: Response) => {
   const { shopId, customerPhone, rating } = req.body as {
-    shopId?: string;
-    customerPhone?: string;
-    rating?: number;
+    shopId?: string; customerPhone?: string; rating?: number;
   };
 
   if (!shopId || !customerPhone || typeof rating !== 'number' || rating < 1 || rating > 5) {
     return res.status(400).json({
-      success: false,
-      message: 'shopId, customerPhone and rating (1–5) are required',
+      success: false, message: 'shopId, customerPhone and rating (1–5) are required',
     });
   }
 
   try {
-    // Upsert: insert new rating or update existing one for this customer
-    await pool.query(
-      `INSERT INTO shop_ratings (shop_id, customer_phone, rating)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (shop_id, customer_phone)
-       DO UPDATE SET rating = EXCLUDED.rating, created_at = NOW()`,
-      [shopId, customerPhone, rating],
+    await ShopRating.findOneAndUpdate(
+      { shopId, customerPhone },
+      { $set: { rating } },
+      { upsert: true, new: true },
     );
 
-    // Recalculate average + count and persist back to the shop row
-    const { rows } = await pool.query(
-      `UPDATE shops
-         SET rating        = (SELECT ROUND(AVG(rating)::numeric, 1) FROM shop_ratings WHERE shop_id = $1),
-             ratings_count = (SELECT COUNT(*)                        FROM shop_ratings WHERE shop_id = $1)
-       WHERE shop_id = $1
-       RETURNING rating, ratings_count`,
-      [shopId],
-    );
+    // Recalculate average
+    const agg = await ShopRating.aggregate([
+      { $match: { shopId } },
+      { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } },
+    ]);
+    const newRating    = agg.length > 0 ? Math.round(agg[0].avg * 10) / 10 : 0;
+    const ratingsCount = agg.length > 0 ? agg[0].count : 0;
 
-    if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Shop not found' });
-    }
+    await Shop.updateOne({ shopId }, { $set: { rating: newRating, ratingsCount } });
 
-    return res.json({
-      success:      true,
-      message:      'Rating submitted successfully',
-      newRating:    rows[0].rating,
-      ratingsCount: rows[0].ratings_count,
-    });
+    return res.json({ success: true, message: 'Rating submitted successfully', newRating, ratingsCount });
   } catch (err) {
     console.error('submitShopRating error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
 
-/**
- * GET /api/shop/myrating/:shopId/:customerPhone
- * Returns the rating this customer has previously submitted for a shop (if any).
- */
 app.get('/api/shop/myrating/:shopId/:customerPhone', async (req: Request, res: Response) => {
   const { shopId, customerPhone } = req.params;
   try {
-    const { rows } = await pool.query(
-      'SELECT rating FROM shop_ratings WHERE shop_id = $1 AND customer_phone = $2',
-      [shopId, customerPhone],
-    );
-    return res.json({
-      success:   true,
-      myRating:  rows.length > 0 ? rows[0].rating : null,
-    });
+    const doc = await ShopRating.findOne({ shopId, customerPhone });
+    return res.json({ success: true, myRating: doc ? doc.rating : null });
   } catch (err) {
     console.error('getMyRating error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
@@ -791,7 +584,8 @@ app.get('/api/shop/myrating/:shopId/:customerPhone', async (req: Request, res: R
 // Start server
 // ─────────────────────────────────────────────────────────────────────────────
 async function main() {
-  await initDb();           // create tables + seed data on first boot
+  await connectDb();
+  await seedDb();
   app.listen(PORT, () => {
     console.log(`✅  ShopApp backend running on http://localhost:${PORT}`);
   });

@@ -1,280 +1,312 @@
-import { Pool } from 'pg';
+import mongoose, { Schema, model, Document } from 'mongoose';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// ── Connection Pool ────────────────────────────────────────────────────────────
-export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Railway PostgreSQL requires SSL in production
-  ssl: process.env.DATABASE_URL?.includes('railway')
-    ? { rejectUnauthorized: false }
-    : false,
-});
+// ── Mongoose Schemas & Models ──────────────────────────────────────────────────
 
-// ── Table Setup + Seeding ──────────────────────────────────────────────────────
-export async function initDb(): Promise<void> {
-  // Create users table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      phone_number      VARCHAR(15)  PRIMARY KEY,
-      role              VARCHAR(10)  NOT NULL CHECK (role IN ('owner', 'customer')),
-      user_id           VARCHAR(50)  UNIQUE NOT NULL,
-      is_setup_complete BOOLEAN      NOT NULL DEFAULT false,
-      name              VARCHAR(100),
-      latitude          DOUBLE PRECISION,
-      longitude         DOUBLE PRECISION,
-      pin               VARCHAR(4)
-    )
-  `);
+// USER
+export interface IUser extends Document {
+  phoneNumber: string;
+  role: 'owner' | 'customer';
+  userId: string;
+  isSetupComplete: boolean;
+  name: string;
+  address?: string;
+  latitude?: number;
+  longitude?: number;
+  pin?: string;
+}
+const userSchema = new Schema<IUser>({
+  phoneNumber:     { type: String, required: true, unique: true },
+  role:            { type: String, required: true, enum: ['owner', 'customer'] },
+  userId:          { type: String, required: true, unique: true },
+  isSetupComplete: { type: Boolean, default: false },
+  name:            { type: String, default: '' },
+  address:         { type: String },
+  latitude:        { type: Number },
+  longitude:       { type: Number },
+  pin:             { type: String },
+}, { timestamps: true });
+export const User = model<IUser>('User', userSchema);
 
-  // Add pin column to existing users rows (migration for older databases)
-  try {
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pin VARCHAR(4)`);
-  } catch (_) { /* column already exists */ }
+// SHOP
+export interface IShop extends Document {
+  shopId: string;
+  ownerId: string;
+  shopName: string;
+  area: string;
+  category: string;
+  isOpen: boolean;
+  rating: number;
+  ownerPhone: string;
+  shopAddress: string;
+  ownerSpecialization: string;
+  latitude?: number;
+  longitude?: number;
+  trialStartDate: Date;
+  isActive: boolean;
+  hasPaid: boolean;
+  paymentReference?: string;
+  deliveryCharge: number;
+  ratingsCount: number;
+  subscriptionPaidAt?: Date;
+}
+const shopSchema = new Schema<IShop>({
+  shopId:              { type: String, required: true, unique: true },
+  ownerId:             { type: String, required: true },
+  shopName:            { type: String, required: true },
+  area:                { type: String, default: '' },
+  category:            { type: String, default: 'General' },
+  isOpen:              { type: Boolean, default: false },
+  rating:              { type: Number, default: 0 },
+  ownerPhone:          { type: String, required: true },
+  shopAddress:         { type: String, default: '' },
+  ownerSpecialization: { type: String, default: '' },
+  latitude:            { type: Number },
+  longitude:           { type: Number },
+  trialStartDate:      { type: Date, default: Date.now },
+  isActive:            { type: Boolean, default: true },
+  hasPaid:             { type: Boolean, default: false },
+  paymentReference:    { type: String },
+  deliveryCharge:      { type: Number, default: 0 },
+  ratingsCount:        { type: Number, default: 0 },
+  subscriptionPaidAt:  { type: Date },
+}, { timestamps: true });
+// Compound index for duplicate shop detection
+shopSchema.index({ shopName: 1, shopAddress: 1 });
+export const Shop = model<IShop>('Shop', shopSchema);
 
-  // Create shops table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shops (
-      shop_id              VARCHAR(50)  PRIMARY KEY,
-      owner_id             VARCHAR(50)  NOT NULL,
-      shop_name            VARCHAR(100) NOT NULL,
-      area                 VARCHAR(100) NOT NULL DEFAULT '',
-      category             VARCHAR(50)  NOT NULL DEFAULT 'General',
-      is_open              BOOLEAN      NOT NULL DEFAULT false,
-      rating               DOUBLE PRECISION NOT NULL DEFAULT 0,
-      owner_phone          VARCHAR(15)  NOT NULL,
-      shop_address         TEXT         NOT NULL DEFAULT '',
-      owner_specialization VARCHAR(50)  NOT NULL DEFAULT '',
-      latitude             DOUBLE PRECISION,
-      longitude            DOUBLE PRECISION,
-      trial_start_date     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-      is_active            BOOLEAN      NOT NULL DEFAULT true,
-      has_paid             BOOLEAN      NOT NULL DEFAULT false,
-      payment_reference    VARCHAR(100),
-      delivery_charge      DOUBLE PRECISION NOT NULL DEFAULT 0,
-      ratings_count        INT              NOT NULL DEFAULT 0,
-      subscription_paid_at TIMESTAMPTZ
-    )
-  `);
+// PRODUCT
+export interface IProduct extends Document {
+  productId: string;
+  shopId: string;
+  name: string;
+  category: string;
+  price: number;
+  stock: number;
+  minStock: number;
+  unit: string;
+  imageUrl: string;
+}
+const productSchema = new Schema<IProduct>({
+  productId: { type: String, required: true, unique: true },
+  shopId:    { type: String, required: true },
+  name:      { type: String, required: true },
+  category:  { type: String, required: true },
+  price:     { type: Number, default: 0 },
+  stock:     { type: Number, default: 0 },
+  minStock:  { type: Number, default: 0 },
+  unit:      { type: String, default: 'pcs' },
+  imageUrl:  { type: String, default: '' },
+}, { timestamps: true });
+export const Product = model<IProduct>('Product', productSchema);
 
-  // Add new columns if they don't exist (for existing databases)
-  const addCol = async (col: string, type: string, def: string) => {
-    try {
-      await pool.query(`ALTER TABLE shops ADD COLUMN IF NOT EXISTS ${col} ${type} ${def}`);
-    } catch (_) { /* column may already exist */ }
-  };
-  await addCol('latitude',          'DOUBLE PRECISION', '');
-  await addCol('longitude',         'DOUBLE PRECISION', '');
-  await addCol('trial_start_date',  'TIMESTAMPTZ',      'DEFAULT NOW()');
-  await addCol('is_active',         'BOOLEAN',          'DEFAULT true');
-  await addCol('has_paid',          'BOOLEAN',          'DEFAULT false');
-  await addCol('payment_reference', 'VARCHAR(100)',     '');
-  await addCol('delivery_charge',      'DOUBLE PRECISION', 'DEFAULT 0');
-  await addCol('ratings_count',         'INT',              'DEFAULT 0');
-  await addCol('subscription_paid_at',  'TIMESTAMPTZ',      '');
+// ORDER ITEM (embedded sub-document)
+const orderItemSchema = new Schema({
+  name:  { type: String, required: true },
+  qty:   { type: Number, default: 1 },
+  price: { type: Number, default: 0 },
+}, { _id: false });
 
-  // Unique constraint: prevent duplicate shop_name + shop_address
-  try {
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_name_address ON shops (LOWER(shop_name), LOWER(shop_address)) WHERE shop_address <> ''`);
-  } catch (_) { /* index may already exist */ }
+// ORDER
+export interface IOrderItem {
+  name: string;
+  qty: number;
+  price: number;
+}
+export interface IOrder extends Document {
+  orderId: string;
+  customerName: string;
+  customerPhone: string;
+  shopId: string;
+  shopName: string;
+  ownerPhone: string;
+  totalAmount: number;
+  status: string;
+  deliveryType: string;
+  deliveryAddress?: string;
+  estimatedPickupTime?: string;
+  wasModifiedByOwner: boolean;
+  removedItemNames: string[];
+  items: IOrderItem[];
+  createdAt: Date;
+}
+const orderSchema = new Schema<IOrder>({
+  orderId:             { type: String, required: true, unique: true },
+  customerName:        { type: String, required: true },
+  customerPhone:       { type: String, required: true },
+  shopId:              { type: String, default: '' },
+  shopName:            { type: String, default: '' },
+  ownerPhone:          { type: String, default: '' },
+  totalAmount:         { type: Number, default: 0 },
+  status:              { type: String, default: 'newOrder', enum: ['newOrder', 'preparing', 'ready', 'completed'] },
+  deliveryType:        { type: String, default: 'delivery', enum: ['delivery', 'pickup'] },
+  deliveryAddress:     { type: String },
+  estimatedPickupTime: { type: String },
+  wasModifiedByOwner:  { type: Boolean, default: false },
+  removedItemNames:    { type: [String], default: [] },
+  items:               { type: [orderItemSchema], default: [] },
+}, { timestamps: true });
+export const Order = model<IOrder>('Order', orderSchema);
 
-  // Create products table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS products (
-      product_id  VARCHAR(50)      PRIMARY KEY,
-      shop_id     VARCHAR(50)      NOT NULL,
-      name        VARCHAR(150)     NOT NULL,
-      category    VARCHAR(50)      NOT NULL,
-      price       DOUBLE PRECISION NOT NULL DEFAULT 0,
-      stock       INT              NOT NULL DEFAULT 0,
-      min_stock   INT              NOT NULL DEFAULT 0,
-      unit        VARCHAR(20)      NOT NULL DEFAULT 'pcs',
-      image_url   TEXT             NOT NULL DEFAULT ''
-    )
-  `);
+// SHOP RATING
+export interface IShopRating extends Document {
+  shopId: string;
+  customerPhone: string;
+  rating: number;
+}
+const shopRatingSchema = new Schema<IShopRating>({
+  shopId:        { type: String, required: true },
+  customerPhone: { type: String, required: true },
+  rating:        { type: Number, required: true, min: 1, max: 5 },
+}, { timestamps: true });
+shopRatingSchema.index({ shopId: 1, customerPhone: 1 }, { unique: true });
+export const ShopRating = model<IShopRating>('ShopRating', shopRatingSchema);
 
-  // Create orders table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS orders (
-      order_id               VARCHAR(50)      PRIMARY KEY,
-      customer_name          VARCHAR(100)     NOT NULL,
-      customer_phone         VARCHAR(15)      NOT NULL,
-      shop_id                VARCHAR(50)      NOT NULL DEFAULT '',
-      shop_name              VARCHAR(100)     NOT NULL DEFAULT '',
-      owner_phone            VARCHAR(15)      NOT NULL DEFAULT '',
-      total_amount           DOUBLE PRECISION NOT NULL DEFAULT 0,
-      status                 VARCHAR(20)      NOT NULL DEFAULT 'newOrder'
-                               CHECK (status IN ('newOrder','preparing','ready','completed')),
-      delivery_type          VARCHAR(10)      NOT NULL DEFAULT 'delivery'
-                               CHECK (delivery_type IN ('delivery','pickup')),
-      delivery_address       TEXT,
-      estimated_pickup_time  VARCHAR(20),
-      was_modified_by_owner  BOOLEAN          NOT NULL DEFAULT false,
-      removed_item_names     TEXT[]           NOT NULL DEFAULT '{}',
-      created_at             TIMESTAMPTZ      NOT NULL DEFAULT NOW()
-    )
-  `);
+// ── Connect to MongoDB ─────────────────────────────────────────────────────────
+export async function connectDb(): Promise<void> {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error('MONGODB_URI environment variable is not set');
+  await mongoose.connect(uri);
+  console.log('🔗  Connected to MongoDB Atlas');
+}
 
-  // Create order_items table
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS order_items (
-      id         SERIAL           PRIMARY KEY,
-      order_id   VARCHAR(50)      NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
-      name       VARCHAR(150)     NOT NULL,
-      qty        INT              NOT NULL DEFAULT 1,
-      price      DOUBLE PRECISION NOT NULL DEFAULT 0
-    )
-  `);
-
-
-  // Create shop_ratings table – one row per customer+shop, prevents duplicate votes
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shop_ratings (
-      id             SERIAL      PRIMARY KEY,
-      shop_id        VARCHAR(50) NOT NULL,
-      customer_phone VARCHAR(15) NOT NULL,
-      rating         SMALLINT    NOT NULL CHECK (rating BETWEEN 1 AND 5),
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT uq_shop_customer UNIQUE (shop_id, customer_phone)
-    )
-  `);
-
-  const { rowCount: userCount } = await pool.query('SELECT 1 FROM users LIMIT 1');
-  if (!userCount) {
-    await pool.query(`
-      INSERT INTO users (phone_number, role, user_id, is_setup_complete, name, pin) VALUES
-      ('9876543210', 'owner',    'u_101', true, 'Sharma Ji',    '1234'),
-      ('1234567890', 'customer', 'u_102', true, 'Rahul Kumar', '1234')
-    `);
+// ── Seed Data (only if collections are empty) ──────────────────────────────────
+export async function seedDb(): Promise<void> {
+  // Seed users
+  const userCount = await User.countDocuments();
+  if (userCount === 0) {
+    await User.insertMany([
+      { phoneNumber: '9876543210', role: 'owner',    userId: 'u_101', isSetupComplete: true, name: 'Sharma Ji',   pin: '1234' },
+      { phoneNumber: '1234567890', role: 'customer', userId: 'u_102', isSetupComplete: true, name: 'Rahul Kumar', pin: '1234' },
+    ]);
     console.log('📦  Seeded 2 users');
   }
-  // ── Seed products (only if table is empty) ──────────────────────────────────
-  const { rowCount: productCount } = await pool.query('SELECT 1 FROM products LIMIT 1');
-  if (!productCount) {
-    await pool.query(`
-      INSERT INTO products (product_id, shop_id, name, category, price, stock, min_stock, unit) VALUES
-      ('p_001','s_001','Basmati Rice 5kg',   'Grocery',     320,  10, 5,  'bag'),
-      ('p_002','s_001','Amul Butter 500g',   'Grocery',     265,  0,  5,  'pack'),
-      ('p_003','s_001','Toor Dal 1kg',       'Grocery',     140,  20, 5,  'kg'),
-      ('p_004','s_001','Sunflower Oil 1L',   'Grocery',     175,  8,  3,  'btl'),
-      ('p_005','s_002','USB-C Cable 2m',     'Electronics', 199,  15, 3,  'pcs'),
-      ('p_006','s_002','Phone Stand',        'Electronics', 249,  0,  2,  'pcs'),
-      ('p_007','s_002','Earphones',          'Electronics', 499,  6,  2,  'pcs'),
-      ('p_008','s_002','Power Bank 10K',     'Electronics', 899,  4,  2,  'pcs'),
-      ('p_009','s_003','Cotton T-Shirt',     'Clothing',    499,  12, 3,  'pcs'),
-      ('p_010','s_003','Formal Shirt',       'Clothing',    899,  0,  2,  'pcs'),
-      ('p_011','s_003','Jeans (Slim Fit)',   'Clothing',    1199, 7,  2,  'pcs'),
-      ('p_012','s_004','Full Cream Milk 1L', 'Dairy',       62,   30, 10, 'btl'),
-      ('p_013','s_004','Paneer 200g',        'Dairy',       90,   0,  5,  'pack'),
-      ('p_014','s_004','Curd 400g',          'Dairy',       45,   20, 5,  'pack'),
-      ('p_015','s_004','Cheese Slice Pack',  'Dairy',       120,  8,  3,  'pack'),
-      ('p_016','s_005','Atta 10kg',          'Grocery',     380,  12, 5,  'bag'),
-      ('p_017','s_005','Sugar 1kg',          'Grocery',     46,   25, 10, 'kg'),
-      ('p_018','s_006','Kurti Set',          'Clothing',    699,  10, 3,  'pcs'),
-      ('p_019','s_006','Saree (Cotton)',     'Clothing',    1499, 5,  2,  'pcs'),
-      ('p_020','s_007','LED Bulb 9W',        'Electronics', 89,   40, 10, 'pcs'),
-      ('p_021','s_007','Extension Board 6pt','Electronics', 349,  8,  3,  'pcs'),
-      ('p_022','s_008','Toned Milk 500ml',   'Dairy',       30,   50, 15, 'btl'),
-      ('p_023','s_008','Dahi 400g',          'Dairy',       42,   18, 5,  'pack')
-    `);
-    console.log('📦  Seeded 23 products');
-  }
-  // ── Seed shops (only if table is empty) ─────────────────────────────────────
-  const { rowCount: shopCount } = await pool.query('SELECT 1 FROM shops LIMIT 1');
-  if (!shopCount) {
-    await pool.query(`
-      INSERT INTO shops
-        (shop_id, owner_id, shop_name, area, category, is_open, rating, owner_phone, shop_address, owner_specialization, latitude, longitude)
-      VALUES
-        ('s_001','u_101','Sharma Grocery',       'Munger',    'Grocery',     true,  4.3,'9876543210','12, Station Road, Munger, Bihar',     'Retail',    25.3745, 86.4735),
-        ('s_002','u_103','RK Electronics',        'Munger',    'Electronics', true,  4.1,'9123456780','45, Kasim Bazar, Munger, Bihar',      'Retail',    25.3750, 86.4740),
-        ('s_003','u_104','Patna Fashions',         'Patna',     'Ethnic Wear', false, 3.8,'9001122334','78, Boring Road, Patna, Bihar',       'Wholesale', 25.6093, 85.1376),
-        ('s_004','u_105','Jamalpur Dairy',         'Jamalpur',  'Dairy',       true,  4.5,'9988776655','3, Loco Colony, Jamalpur, Bihar',    'Retail',    25.3133, 86.4875),
-        ('s_005','u_106','Munger Mart',            'Munger',    'Grocery',     true,  4.0,'9445566778','22, Gandhi Chowk, Munger, Bihar',    'Both',      25.3760, 86.4730),
-        ('s_006','u_107','Darbhanga Cloth House',  'Darbhanga', 'Fabrics',     true,  4.2,'9554433221','56, Laheriasarai, Darbhanga, Bihar', 'Wholesale', 26.1523, 85.8915),
-        ('s_007','u_108','Patna Electronics Hub',  'Patna',     'Electronics', false, 3.9,'9667788990','90, Frazer Road, Patna, Bihar',      'Retail',    25.6128, 85.1411),
-        ('s_008','u_109','Fresh Dairy Munger',     'Munger',    'Dairy',       true,  4.4,'9778899001','8, Civil Lines, Munger, Bihar',      'Retail',    25.3770, 86.4720)
-    `);
+
+  // Seed shops
+  const shopCount = await Shop.countDocuments();
+  if (shopCount === 0) {
+    await Shop.insertMany([
+      { shopId: 's_001', ownerId: 'u_101', shopName: 'Sharma Grocery',        area: 'Munger',    category: 'Grocery',     isOpen: true,  rating: 4.3, ownerPhone: '9876543210', shopAddress: '12, Station Road, Munger, Bihar',     ownerSpecialization: 'Retail',    latitude: 25.3745, longitude: 86.4735 },
+      { shopId: 's_002', ownerId: 'u_103', shopName: 'RK Electronics',        area: 'Munger',    category: 'Electronics', isOpen: true,  rating: 4.1, ownerPhone: '9123456780', shopAddress: '45, Kasim Bazar, Munger, Bihar',      ownerSpecialization: 'Retail',    latitude: 25.3750, longitude: 86.4740 },
+      { shopId: 's_003', ownerId: 'u_104', shopName: 'Patna Fashions',        area: 'Patna',     category: 'Ethnic Wear', isOpen: false, rating: 3.8, ownerPhone: '9001122334', shopAddress: '78, Boring Road, Patna, Bihar',       ownerSpecialization: 'Wholesale', latitude: 25.6093, longitude: 85.1376 },
+      { shopId: 's_004', ownerId: 'u_105', shopName: 'Jamalpur Dairy',        area: 'Jamalpur',  category: 'Dairy',       isOpen: true,  rating: 4.5, ownerPhone: '9988776655', shopAddress: '3, Loco Colony, Jamalpur, Bihar',     ownerSpecialization: 'Retail',    latitude: 25.3133, longitude: 86.4875 },
+      { shopId: 's_005', ownerId: 'u_106', shopName: 'Munger Mart',           area: 'Munger',    category: 'Grocery',     isOpen: true,  rating: 4.0, ownerPhone: '9445566778', shopAddress: '22, Gandhi Chowk, Munger, Bihar',     ownerSpecialization: 'Both',      latitude: 25.3760, longitude: 86.4730 },
+      { shopId: 's_006', ownerId: 'u_107', shopName: 'Darbhanga Cloth House', area: 'Darbhanga', category: 'Fabrics',     isOpen: true,  rating: 4.2, ownerPhone: '9554433221', shopAddress: '56, Laheriasarai, Darbhanga, Bihar',  ownerSpecialization: 'Wholesale', latitude: 26.1523, longitude: 85.8915 },
+      { shopId: 's_007', ownerId: 'u_108', shopName: 'Patna Electronics Hub', area: 'Patna',     category: 'Electronics', isOpen: false, rating: 3.9, ownerPhone: '9667788990', shopAddress: '90, Frazer Road, Patna, Bihar',       ownerSpecialization: 'Retail',    latitude: 25.6128, longitude: 85.1411 },
+      { shopId: 's_008', ownerId: 'u_109', shopName: 'Fresh Dairy Munger',    area: 'Munger',    category: 'Dairy',       isOpen: true,  rating: 4.4, ownerPhone: '9778899001', shopAddress: '8, Civil Lines, Munger, Bihar',       ownerSpecialization: 'Retail',    latitude: 25.3770, longitude: 86.4720 },
+    ]);
     console.log('📦  Seeded 8 shops');
+  }
+
+  // Seed products
+  const productCount = await Product.countDocuments();
+  if (productCount === 0) {
+    await Product.insertMany([
+      { productId: 'p_001', shopId: 's_001', name: 'Basmati Rice 5kg',    category: 'Grocery',     price: 320,  stock: 10, minStock: 5,  unit: 'bag' },
+      { productId: 'p_002', shopId: 's_001', name: 'Amul Butter 500g',    category: 'Grocery',     price: 265,  stock: 0,  minStock: 5,  unit: 'pack' },
+      { productId: 'p_003', shopId: 's_001', name: 'Toor Dal 1kg',        category: 'Grocery',     price: 140,  stock: 20, minStock: 5,  unit: 'kg' },
+      { productId: 'p_004', shopId: 's_001', name: 'Sunflower Oil 1L',    category: 'Grocery',     price: 175,  stock: 8,  minStock: 3,  unit: 'btl' },
+      { productId: 'p_005', shopId: 's_002', name: 'USB-C Cable 2m',      category: 'Electronics', price: 199,  stock: 15, minStock: 3,  unit: 'pcs' },
+      { productId: 'p_006', shopId: 's_002', name: 'Phone Stand',         category: 'Electronics', price: 249,  stock: 0,  minStock: 2,  unit: 'pcs' },
+      { productId: 'p_007', shopId: 's_002', name: 'Earphones',           category: 'Electronics', price: 499,  stock: 6,  minStock: 2,  unit: 'pcs' },
+      { productId: 'p_008', shopId: 's_002', name: 'Power Bank 10K',      category: 'Electronics', price: 899,  stock: 4,  minStock: 2,  unit: 'pcs' },
+      { productId: 'p_009', shopId: 's_003', name: 'Cotton T-Shirt',      category: 'Clothing',    price: 499,  stock: 12, minStock: 3,  unit: 'pcs' },
+      { productId: 'p_010', shopId: 's_003', name: 'Formal Shirt',        category: 'Clothing',    price: 899,  stock: 0,  minStock: 2,  unit: 'pcs' },
+      { productId: 'p_011', shopId: 's_003', name: 'Jeans (Slim Fit)',    category: 'Clothing',    price: 1199, stock: 7,  minStock: 2,  unit: 'pcs' },
+      { productId: 'p_012', shopId: 's_004', name: 'Full Cream Milk 1L',  category: 'Dairy',       price: 62,   stock: 30, minStock: 10, unit: 'btl' },
+      { productId: 'p_013', shopId: 's_004', name: 'Paneer 200g',         category: 'Dairy',       price: 90,   stock: 0,  minStock: 5,  unit: 'pack' },
+      { productId: 'p_014', shopId: 's_004', name: 'Curd 400g',           category: 'Dairy',       price: 45,   stock: 20, minStock: 5,  unit: 'pack' },
+      { productId: 'p_015', shopId: 's_004', name: 'Cheese Slice Pack',   category: 'Dairy',       price: 120,  stock: 8,  minStock: 3,  unit: 'pack' },
+      { productId: 'p_016', shopId: 's_005', name: 'Atta 10kg',           category: 'Grocery',     price: 380,  stock: 12, minStock: 5,  unit: 'bag' },
+      { productId: 'p_017', shopId: 's_005', name: 'Sugar 1kg',           category: 'Grocery',     price: 46,   stock: 25, minStock: 10, unit: 'kg' },
+      { productId: 'p_018', shopId: 's_006', name: 'Kurti Set',           category: 'Clothing',    price: 699,  stock: 10, minStock: 3,  unit: 'pcs' },
+      { productId: 'p_019', shopId: 's_006', name: 'Saree (Cotton)',      category: 'Clothing',    price: 1499, stock: 5,  minStock: 2,  unit: 'pcs' },
+      { productId: 'p_020', shopId: 's_007', name: 'LED Bulb 9W',         category: 'Electronics', price: 89,   stock: 40, minStock: 10, unit: 'pcs' },
+      { productId: 'p_021', shopId: 's_007', name: 'Extension Board 6pt', category: 'Electronics', price: 349,  stock: 8,  minStock: 3,  unit: 'pcs' },
+      { productId: 'p_022', shopId: 's_008', name: 'Toned Milk 500ml',    category: 'Dairy',       price: 30,   stock: 50, minStock: 15, unit: 'btl' },
+      { productId: 'p_023', shopId: 's_008', name: 'Dahi 400g',           category: 'Dairy',       price: 42,   stock: 18, minStock: 5,  unit: 'pack' },
+    ]);
+    console.log('📦  Seeded 23 products');
   }
 
   console.log('✅  Database initialised');
 }
 
-// ── Row → JSON mappers ─────────────────────────────────────────────────────────
+// ── Document → JSON mappers (keep same API response shape) ─────────────────────
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function rowToUser(row: any) {
+export function docToUser(doc: any) {
   return {
-    phoneNumber:      row.phone_number,
-    role:             row.role,
-    userId:           row.user_id,
-    isSetupComplete:  row.is_setup_complete,
-    name:             row.name ?? '',
-    latitude:         row.latitude  ?? undefined,
-    longitude:        row.longitude ?? undefined,
+    phoneNumber:     doc.phoneNumber,
+    role:            doc.role,
+    userId:          doc.userId,
+    isSetupComplete: doc.isSetupComplete,
+    name:            doc.name ?? '',
+    latitude:        doc.latitude  ?? undefined,
+    longitude:       doc.longitude ?? undefined,
   };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function rowToShop(row: any) {
+export function docToShop(doc: any) {
   return {
-    shopId:              row.shop_id,
-    ownerId:             row.owner_id,
-    shopName:            row.shop_name,
-    area:                row.area,
-    category:            row.category,
-    isOpen:              row.is_open,
-    rating:              row.rating,
-    ownerPhone:          row.owner_phone,
-    shopAddress:         row.shop_address,
-    ownerSpecialization: row.owner_specialization,
-    latitude:            row.latitude  ?? null,
-    longitude:           row.longitude ?? null,
-    trialStartDate:      row.trial_start_date ?? null,
-    isActive:            row.is_active ?? true,
-    hasPaid:             row.has_paid  ?? false,
-    paymentReference:    row.payment_reference ?? null,
-    deliveryCharge:       row.delivery_charge ?? 0,
-    ratingsCount:         row.ratings_count   ?? 0,
-    subscriptionPaidAt:   row.subscription_paid_at ?? null,
+    shopId:              doc.shopId,
+    ownerId:             doc.ownerId,
+    shopName:            doc.shopName,
+    area:                doc.area,
+    category:            doc.category,
+    isOpen:              doc.isOpen,
+    rating:              doc.rating,
+    ownerPhone:          doc.ownerPhone,
+    shopAddress:         doc.shopAddress,
+    ownerSpecialization: doc.ownerSpecialization,
+    latitude:            doc.latitude  ?? null,
+    longitude:           doc.longitude ?? null,
+    trialStartDate:      doc.trialStartDate ?? null,
+    isActive:            doc.isActive ?? true,
+    hasPaid:             doc.hasPaid  ?? false,
+    paymentReference:    doc.paymentReference ?? null,
+    deliveryCharge:      doc.deliveryCharge ?? 0,
+    ratingsCount:        doc.ratingsCount   ?? 0,
+    subscriptionPaidAt:  doc.subscriptionPaidAt ?? null,
   };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function rowToProduct(row: any) {
+export function docToProduct(doc: any) {
   return {
-    productId:  row.product_id,
-    shopId:     row.shop_id,
-    name:       row.name,
-    category:   row.category,
-    price:      row.price,
-    stock:      row.stock,
-    minStock:   row.min_stock,
-    unit:       row.unit,
-    imageUrl:   row.image_url ?? '',
+    productId: doc.productId,
+    shopId:    doc.shopId,
+    name:      doc.name,
+    category:  doc.category,
+    price:     doc.price,
+    stock:     doc.stock,
+    minStock:  doc.minStock,
+    unit:      doc.unit,
+    imageUrl:  doc.imageUrl ?? '',
   };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function rowToOrder(row: any, items: any[] = []) {
+export function docToOrder(doc: any) {
   return {
-    orderId:             row.order_id,
-    customerName:        row.customer_name,
-    customerPhone:       row.customer_phone,
-    shopId:              row.shop_id,
-    shopName:            row.shop_name,
-    ownerPhone:          row.owner_phone,
-    totalAmount:         row.total_amount,
-    status:              row.status,
-    deliveryType:        row.delivery_type,
-    deliveryAddress:     row.delivery_address      ?? undefined,
-    estimatedPickupTime: row.estimated_pickup_time ?? undefined,
-    wasModifiedByOwner:  row.was_modified_by_owner,
-    removedItemNames:    row.removed_item_names    ?? [],
-    createdAt:           row.created_at,
-    items: items.map((i) => ({
+    orderId:             doc.orderId,
+    customerName:        doc.customerName,
+    customerPhone:       doc.customerPhone,
+    shopId:              doc.shopId,
+    shopName:            doc.shopName,
+    ownerPhone:          doc.ownerPhone,
+    totalAmount:         doc.totalAmount,
+    status:              doc.status,
+    deliveryType:        doc.deliveryType,
+    deliveryAddress:     doc.deliveryAddress     ?? undefined,
+    estimatedPickupTime: doc.estimatedPickupTime ?? undefined,
+    wasModifiedByOwner:  doc.wasModifiedByOwner,
+    removedItemNames:    doc.removedItemNames    ?? [],
+    createdAt:           doc.createdAt,
+    items: (doc.items || []).map((i: any) => ({
       name:     i.name,
       qty:      i.qty,
       price:    i.price,
