@@ -51,6 +51,7 @@ export interface IShop extends Document {
   deliveryCharge: number;
   ratingsCount: number;
   subscriptionPaidAt?: Date;
+  averageDeliveryTime: string;
 }
 const shopSchema = new Schema<IShop>({
   shopId:              { type: String, required: true, unique: true },
@@ -72,6 +73,7 @@ const shopSchema = new Schema<IShop>({
   deliveryCharge:      { type: Number, default: 0 },
   ratingsCount:        { type: Number, default: 0 },
   subscriptionPaidAt:  { type: Date },
+  averageDeliveryTime: { type: String, default: '30-45 mins' },
 }, { timestamps: true });
 // Compound index for duplicate shop detection
 shopSchema.index({ shopName: 1, shopAddress: 1 });
@@ -164,6 +166,35 @@ const shopRatingSchema = new Schema<IShopRating>({
 shopRatingSchema.index({ shopId: 1, customerPhone: 1 }, { unique: true });
 export const ShopRating = model<IShopRating>('ShopRating', shopRatingSchema);
 
+// SHOP CATEGORY (dynamic, managed from backend)
+export interface IShopCategory extends Document {
+  name: string;
+  iconUrl?: string;
+}
+const shopCategorySchema = new Schema<IShopCategory>({
+  name:    { type: String, required: true, unique: true },
+  iconUrl: { type: String, default: '' },
+}, { timestamps: true });
+export const ShopCategory = model<IShopCategory>('ShopCategory', shopCategorySchema);
+
+// ANALYTICS SUMMARY (daily per-shop aggregation)
+export interface IAnalyticsSummary extends Document {
+  shopId: string;
+  date: string; // YYYY-MM-DD
+  revenue: number;
+  orderCount: number;
+  topProducts: { name: string; qty: number }[];
+}
+const analyticsSummarySchema = new Schema<IAnalyticsSummary>({
+  shopId:      { type: String, required: true },
+  date:        { type: String, required: true },
+  revenue:     { type: Number, default: 0 },
+  orderCount:  { type: Number, default: 0 },
+  topProducts: { type: [{ name: String, qty: Number }], default: [] },
+}, { timestamps: true });
+analyticsSummarySchema.index({ shopId: 1, date: 1 }, { unique: true });
+export const AnalyticsSummary = model<IAnalyticsSummary>('AnalyticsSummary', analyticsSummarySchema);
+
 // ── Connect to MongoDB ─────────────────────────────────────────────────────────
 export async function connectDb(): Promise<void> {
   const uri = process.env.MONGODB_URI;
@@ -231,6 +262,65 @@ export async function seedDb(): Promise<void> {
     console.log('📦  Seeded 23 products');
   }
 
+  // Seed shop categories
+  const catCount = await ShopCategory.countDocuments();
+  if (catCount === 0) {
+    await ShopCategory.insertMany([
+      { name: 'Grocery' },
+      { name: 'Electronics' },
+      { name: 'Clothing' },
+      { name: 'Dairy' },
+      { name: 'Ethnic Wear' },
+      { name: 'Fusion Wear' },
+      { name: 'Fabrics' },
+      { name: 'Hardware' },
+      { name: 'Bakery' },
+      { name: 'Stationery' },
+      { name: 'Medical' },
+      { name: 'Other' },
+    ]);
+    console.log('📦  Seeded shop categories');
+  }
+
+  // Seed analytics dummy data (30 days for s_001 Sharma Grocery)
+  const analyticsCount = await AnalyticsSummary.countDocuments();
+  if (analyticsCount === 0) {
+    const now = new Date();
+    const entries = [];
+    const productNames = ['Basmati Rice 5kg', 'Amul Butter 500g', 'Toor Dal 1kg', 'Sunflower Oil 1L'];
+    for (let i = 30; i >= 1; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      // Simulate realistic daily revenue with some variance
+      const baseRevenue = 800 + Math.floor(Math.random() * 1200); // 800-2000
+      const orderCount = 3 + Math.floor(Math.random() * 8); // 3-10
+      // Pick 3 random top products
+      const shuffled = [...productNames].sort(() => Math.random() - 0.5);
+      const topProducts = shuffled.slice(0, 3).map((name, idx) => ({
+        name,
+        qty: 5 - idx + Math.floor(Math.random() * 4),
+      }));
+      entries.push({ shopId: 's_001', date: dateStr, revenue: baseRevenue, orderCount, topProducts });
+    }
+    // Also add some for s_002 (RK Electronics) — last 20 days
+    for (let i = 20; i >= 1; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      const baseRevenue = 1500 + Math.floor(Math.random() * 3000);
+      const orderCount = 2 + Math.floor(Math.random() * 5);
+      const topProducts = [
+        { name: 'USB-C Cable 2m', qty: 4 + Math.floor(Math.random() * 3) },
+        { name: 'Power Bank 10K', qty: 2 + Math.floor(Math.random() * 3) },
+        { name: 'Earphones', qty: 1 + Math.floor(Math.random() * 3) },
+      ];
+      entries.push({ shopId: 's_002', date: dateStr, revenue: baseRevenue, orderCount, topProducts });
+    }
+    await AnalyticsSummary.insertMany(entries);
+    console.log(`📦  Seeded ${entries.length} analytics entries`);
+  }
+
   console.log('✅  Database initialised');
 }
 
@@ -271,6 +361,7 @@ export function docToShop(doc: any) {
     deliveryCharge:      doc.deliveryCharge ?? 0,
     ratingsCount:        doc.ratingsCount   ?? 0,
     subscriptionPaidAt:  doc.subscriptionPaidAt ?? null,
+    averageDeliveryTime: doc.averageDeliveryTime ?? '30-45 mins',
   };
 }
 

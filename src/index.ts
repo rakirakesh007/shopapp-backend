@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-import { connectDb, seedDb, User, Shop, Product, Order, ShopRating,
+import { connectDb, seedDb, User, Shop, Product, Order, ShopRating, ShopCategory, AnalyticsSummary,
          docToUser, docToShop, docToProduct, docToOrder } from './db';
 
 dotenv.config();
@@ -18,6 +18,17 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // ── Health check ───────────────────────────────────────────────────────────────
 app.get('/', (_req: Request, res: Response) => {
   res.json({ status: 'ok', message: 'ShopApp API is running 🚀' });
+});
+
+// ── Categories ─────────────────────────────────────────────────────────────────
+app.get('/api/categories', async (_req: Request, res: Response) => {
+  try {
+    const cats = await ShopCategory.find().sort({ name: 1 });
+    return res.json({ success: true, categories: cats.map(c => ({ id: c._id, name: c.name, iconUrl: c.iconUrl ?? '' })) });
+  } catch (err) {
+    console.error('getCategories error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,11 +166,12 @@ app.get('/api/shop/:phoneNumber', async (req: Request, res: Response) => {
 });
 
 app.patch('/api/shop/details', async (req: Request, res: Response) => {
-  const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName, latitude, longitude, deliveryCharge } =
+  const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName, latitude, longitude, deliveryCharge, averageDeliveryTime } =
     req.body as {
       phoneNumber?: string; shopName?: string; category?: string;
       shopAddress?: string; ownerSpecialization?: string; ownerName?: string;
       latitude?: number; longitude?: number; deliveryCharge?: number;
+      averageDeliveryTime?: string;
     };
 
   if (!phoneNumber) {
@@ -186,6 +198,7 @@ app.patch('/api/shop/details', async (req: Request, res: Response) => {
     if (latitude !== undefined)            update.latitude = latitude;
     if (longitude !== undefined)           update.longitude = longitude;
     if (deliveryCharge !== undefined)       update.deliveryCharge = deliveryCharge;
+    if (averageDeliveryTime !== undefined)  update.averageDeliveryTime = averageDeliveryTime;
 
     if (Object.keys(update).length > 0) {
       await Shop.updateOne({ ownerPhone: phoneNumber }, { $set: update });
@@ -576,6 +589,119 @@ app.get('/api/shop/myrating/:shopId/:customerPhone', async (req: Request, res: R
     return res.json({ success: true, myRating: doc ? doc.rating : null });
   } catch (err) {
     console.error('getMyRating error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANALYTICS ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Daily aggregation function — call via cron or manually
+async function aggregateYesterday(shopId: string) {
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const dateStr = yesterday.toISOString().slice(0, 10);
+  const startOfDay = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate());
+  const endOfDay = new Date(startOfDay);
+  endOfDay.setDate(endOfDay.getDate() + 1);
+
+  const orders = await Order.find({
+    shopId,
+    status: 'completed',
+    createdAt: { $gte: startOfDay, $lt: endOfDay },
+  });
+
+  const revenue = orders.reduce((s, o) => s + o.totalAmount, 0);
+  const orderCount = orders.length;
+
+  // Top products
+  const prodMap: Record<string, number> = {};
+  orders.forEach(o => o.items.forEach((i: any) => {
+    prodMap[i.name] = (prodMap[i.name] || 0) + i.qty;
+  }));
+  const topProducts = Object.entries(prodMap)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([name, qty]) => ({ name, qty }));
+
+  await AnalyticsSummary.findOneAndUpdate(
+    { shopId, date: dateStr },
+    { $set: { revenue, orderCount, topProducts } },
+    { upsert: true, new: true },
+  );
+}
+
+app.get('/api/analytics/:shopId', async (req: Request, res: Response) => {
+  const { shopId } = req.params;
+  try {
+    // Trigger yesterday aggregation (lazy)
+    await aggregateYesterday(shopId);
+
+    // Last 30 days
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const startDate = thirtyDaysAgo.toISOString().slice(0, 10);
+
+    const summaries = await AnalyticsSummary.find({
+      shopId,
+      date: { $gte: startDate },
+    }).sort({ date: 1 });
+
+    // This week vs last week comparison
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const dayOfWeek = todayStart.getDay() || 7; // Mon=1
+    const thisWeekStart = new Date(todayStart);
+    thisWeekStart.setDate(thisWeekStart.getDate() - dayOfWeek + 1);
+    const lastWeekStart = new Date(thisWeekStart);
+    lastWeekStart.setDate(lastWeekStart.getDate() - 7);
+
+    const thisWeekStr = thisWeekStart.toISOString().slice(0, 10);
+    const lastWeekStr = lastWeekStart.toISOString().slice(0, 10);
+
+    let thisWeekRev = 0, lastWeekRev = 0;
+    summaries.forEach(s => {
+      if (s.date >= thisWeekStr) thisWeekRev += s.revenue;
+      else if (s.date >= lastWeekStr && s.date < thisWeekStr) lastWeekRev += s.revenue;
+    });
+
+    const comparison = lastWeekRev > 0
+      ? Math.round(((thisWeekRev - lastWeekRev) / lastWeekRev) * 100)
+      : (thisWeekRev > 0 ? 100 : 0);
+
+    // Top 3 selling from yesterday
+    const yesterdayStr = new Date(now.getTime() - 86400000).toISOString().slice(0, 10);
+    const yesterdaySummary = summaries.find(s => s.date === yesterdayStr);
+
+    return res.json({
+      success: true,
+      dailySales: summaries.map(s => ({ date: s.date, revenue: s.revenue, orders: s.orderCount })),
+      topProducts: yesterdaySummary?.topProducts ?? [],
+      comparison: { thisWeek: thisWeekRev, lastWeek: lastWeekRev, percentChange: comparison },
+    });
+  } catch (err) {
+    console.error('getAnalytics error:', err);
+    return res.status(500).json({ success: false, message: 'Database error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USER ROUTE
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/user', async (req: Request, res: Response) => {
+  const { phoneNumber } = req.query as { phoneNumber?: string };
+  if (!phoneNumber) {
+    return res.status(400).json({ success: false, message: 'phoneNumber is required' });
+  }
+  try {
+    const user = await User.findOne({ phoneNumber });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.json({ success: true, user: docToUser(user) });
+  } catch (err) {
+    console.error('fetchUser error:', err);
     return res.status(500).json({ success: false, message: 'Database error' });
   }
 });
