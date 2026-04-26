@@ -166,12 +166,12 @@ app.get('/api/shop/:phoneNumber', async (req: Request, res: Response) => {
 });
 
 app.patch('/api/shop/details', async (req: Request, res: Response) => {
-  const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName, latitude, longitude, deliveryCharge, averageDeliveryTime } =
+  const { phoneNumber, shopName, category, shopAddress, ownerSpecialization, ownerName, latitude, longitude, deliveryCharge, averageDeliveryTime, area } =
     req.body as {
       phoneNumber?: string; shopName?: string; category?: string;
       shopAddress?: string; ownerSpecialization?: string; ownerName?: string;
       latitude?: number; longitude?: number; deliveryCharge?: number;
-      averageDeliveryTime?: string;
+      averageDeliveryTime?: string; area?: string;
     };
 
   if (!phoneNumber) {
@@ -199,6 +199,7 @@ app.patch('/api/shop/details', async (req: Request, res: Response) => {
     if (longitude !== undefined)           update.longitude = longitude;
     if (deliveryCharge !== undefined)       update.deliveryCharge = deliveryCharge;
     if (averageDeliveryTime !== undefined)  update.averageDeliveryTime = averageDeliveryTime;
+    if (area !== undefined)                update.area = area;
 
     if (Object.keys(update).length > 0) {
       await Shop.updateOne({ ownerPhone: phoneNumber }, { $set: update });
